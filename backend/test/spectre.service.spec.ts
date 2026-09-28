@@ -2,7 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JsonStore } from '../src/store';
+import { JsonStore, ScopeContext } from '../src/store';
 import { SpectreService } from '../src/spectre.service';
 
 describe('SpectreService (unit)', () => {
@@ -11,7 +11,7 @@ describe('SpectreService (unit)', () => {
 
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), 'spectre-unit-'));
-    service = new SpectreService(new JsonStore(join(directory, 'data.json')));
+    service = new SpectreService(new JsonStore(new ScopeContext(), join(directory, 'data.json')));
   });
   afterEach(() => rmSync(directory, { recursive: true, force: true }));
 

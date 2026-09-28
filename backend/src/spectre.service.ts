@@ -31,6 +31,7 @@ export class SpectreService {
     const task = {
       id: this.store.id(), title: input.title.trim(), description: input.description?.trim() || '',
       start: input.start, due: input.due, status: input.status, priority: input.priority,
+      emailReminder: Boolean(input.emailReminder),
       folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: input.subtasks || [],
       attachments: input.attachments || [], notes: input.notes?.trim() || '',
       recurrence: input.recurrence || '', reminder: input.reminder || '', notified: false,
