@@ -1,0 +1,13 @@
+{
+  "name": "spectre-todo",
+  "private": true,
+  "version": "1.0.0",
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "pnpm --parallel -r --filter @spectre/api --filter @spectre/web dev",
+    "build": "pnpm --filter @spectre/api build && pnpm --filter @spectre/web build",
+    "test": "pnpm --filter @spectre/api test",
+    "test:unit": "pnpm --filter @spectre/api test:unit",
+    "test:integration": "pnpm --filter @spectre/api test:integration"
+  }
+}
