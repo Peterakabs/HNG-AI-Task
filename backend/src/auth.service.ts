@@ -6,7 +6,7 @@ import type { NextFunction, Request, Response } from 'express';
 import { JsonStore, ScopeContext } from './store';
 
 type User = { id: string; email: string; passwordHash: string; createdAt: number; updatedAt: number };
-type AuthData = { users: User[]; scheduledActions: Record<string, any>[]; invitations: Record<string, any>[] };
+type AuthData = { users: User[]; scheduledActions: Record<string, any>[] };
 export type RequestIdentity = { type: 'user'; id: string } | { type: 'guest'; deviceId: string };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -34,14 +34,6 @@ export class AuthService {
     if (data.users.some((user) => user.email === email)) throw new BadRequestException('An account with this email already exists.');
     const user: User = { id: randomBytes(16).toString('hex'), email, passwordHash: this.hashPassword(password), createdAt: Date.now(), updatedAt: Date.now() };
     data.users.push(user);
-    let acceptedInvitation: any;
-    if (input.invitationToken) {
-      acceptedInvitation = data.invitations.find((invite) => invite.token === input.invitationToken);
-      if (!acceptedInvitation || acceptedInvitation.status !== 'pending' || acceptedInvitation.expiresAt <= Date.now() || acceptedInvitation.recipientEmail !== email) {
-        throw new BadRequestException('This invitation is invalid, expired, or belongs to another email address.');
-      }
-      acceptedInvitation.status = 'accepted'; acceptedInvitation.acceptedAt = Date.now();
-    }
     this.write(data);
     this.store.copyGuestToAccount(deviceId, user.id);
     return { user: this.publicUser(user), session: this.issueSession(user.id) };
@@ -77,37 +69,6 @@ export class AuthService {
   listActions(userId: string) { return this.read().scheduledActions.filter((action) => action.creatorUserId === userId).sort((a, b) => a.scheduledAt - b.scheduledAt); }
   getAction(userId: string, id: string) { const action = this.read().scheduledActions.find((item) => item.id === id && item.creatorUserId === userId); if (!action) throw new UnauthorizedException('Scheduled action not found.'); return action; }
 
-  async createInvitation(userId: string, input: Record<string, any>) {
-    const recipientName = this.required(input.recipientName, 'Recipient name'); const recipientEmail = this.cleanEmail(input.recipientEmail);
-    const data = this.read();
-    if (data.users.some((user) => user.email === recipientEmail)) throw new BadRequestException('This recipient already has an account.');
-    const invitation = { id: randomBytes(16).toString('hex'), senderUserId: userId, recipientEmail, recipientName, token: randomBytes(32).toString('base64url'), createdAt: Date.now(), expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000, status: 'pending' };
-    data.invitations.push(invitation); this.write(data); return invitation;
-  }
-  listInvitations(userId: string) { return this.read().invitations.filter((invite) => invite.senderUserId === userId).map(({ token, senderUserId: _senderId, ...invite }) => invite); }
-  cancelInvitation(userId: string, id: string) {
-    const data = this.read(); const invite = data.invitations.find((item) => item.id === id && item.senderUserId === userId);
-    if (!invite) throw new UnauthorizedException('Invitation not found.');
-    if (invite.status === 'pending') invite.status = 'cancelled'; this.write(data); return invite;
-  }
-  acceptInvitation(userId: string, token: string) {
-    const data = this.read(); const invite = data.invitations.find((item) => item.token === token);
-    const user = data.users.find((item) => item.id === userId);
-    if (!invite || !user || invite.status !== 'pending' || invite.expiresAt <= Date.now() || invite.recipientEmail !== user.email) throw new BadRequestException('This invitation is invalid, expired, or belongs to another email address.');
-    invite.status = 'accepted'; invite.acceptedAt = Date.now(); this.write(data); return { status: invite.status };
-  }
-  invitationByToken(token: string) {
-    const data = this.read(); const invite = data.invitations.find((item) => item.token === token);
-    if (!invite) throw new UnauthorizedException('Invitation not found.');
-    if (invite.status === 'pending' && invite.expiresAt <= Date.now()) { invite.status = 'expired'; this.write(data); }
-    const { token: _token, senderUserId: _senderId, ...safe } = invite; return safe;
-  }
-
-  async sendInvitationMail(invitation: Record<string, any>) {
-    const appName = process.env.APP_NAME || 'Spectre'; const baseUrl = (process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, '');
-    const link = `${baseUrl}/?invite=${encodeURIComponent(invitation.token)}`;
-    await this.sendEmail(invitation.recipientEmail, `Invitation to ${appName}`, `Hi ${invitation.recipientName},\n\nYou have been invited to join ${appName}. Create your account with this email address using this link:\n${link}\n\nThis link expires in 7 days.`);
-  }
   async sendEmail(to: string, subject: string, text: string) {
     const key = process.env.SENDGRID_API_KEY; const from = process.env.EMAIL_FROM;
     if (!key || !from) throw new Error('Email delivery is not configured. Set SENDGRID_API_KEY and EMAIL_FROM.');
@@ -116,14 +77,13 @@ export class AuthService {
   }
 
   private read(): AuthData {
-    if (!existsSync(this.path)) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); return { users: [], scheduledActions: [], invitations: [] }; }
+    if (!existsSync(this.path)) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); return { users: [], scheduledActions: [] }; }
     const data = JSON.parse(readFileSync(this.path, 'utf8'));
-    return { users: data.users || [], scheduledActions: data.scheduledActions || [], invitations: data.invitations || [] };
+    return { users: data.users || [], scheduledActions: data.scheduledActions || [] };
   }
   write(data: AuthData) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); const temporary = `${this.path}.tmp`; writeFileSync(temporary, JSON.stringify(data, null, 2)); renameSync(temporary, this.path); }
   claimDueActions() {
     const data = this.read(); const now = Date.now();
-    data.invitations.forEach((invite) => { if (invite.status === 'pending' && invite.expiresAt <= now) invite.status = 'expired'; });
     const due = data.scheduledActions.filter((action) => action.status === 'scheduled' && action.scheduledAt <= now);
     due.forEach((action) => { action.status = 'sending'; action.attemptedAt = now; });
     if (due.length) this.write(data);

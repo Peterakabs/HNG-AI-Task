@@ -42,15 +42,6 @@ describe('AuthService (unit)', () => {
     expect(() => auth.createAction(user.id, { ...input, confirmed: false })).toThrow();
   });
 
-  it('creates a private random invitation token and validates recipient email on registration', async () => {
-    const { user } = await auth.register({ email: 'sender@example.com', password: 'correct horse battery' }, 'device-3');
-    const invitation = await auth.createInvitation(user.id, { recipientName: 'Michael', recipientEmail: 'michael@example.com' });
-    expect(invitation.token).toHaveLength(43);
-    expect(auth.invitationByToken(invitation.token).senderUserId).toBeUndefined();
-    await expect(auth.register({ email: 'someone-else@example.com', password: 'correct horse battery', invitationToken: invitation.token }, 'device-4')).rejects.toThrow();
-    const accepted = await auth.register({ email: 'michael@example.com', password: 'correct horse battery', invitationToken: invitation.token }, 'device-5');
-    expect(accepted.user.email).toBe('michael@example.com');
-  });
 
   it('executes a due reminder once and records provider failure without retrying it', async () => {
     const { user } = await auth.register({ email: 'worker@example.com', password: 'correct horse battery' }, 'device-6');

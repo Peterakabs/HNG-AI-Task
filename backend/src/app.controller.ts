@@ -20,23 +20,10 @@ export class AppController {
   }
   @Post('auth/logout') logout(@Res({ passthrough: true }) response: Response) { response.clearCookie('spectre_session', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', path: '/' }); return { status: 'ok' }; }
   @Get('auth/me') me(@Req() request: IdentityRequest) { return request.identity?.type === 'user' ? this.auth.getUser(request.identity.id) : null; }
-  @Get('auth/invitations/:token') invitation(@Param('token') token: string) { return this.auth.invitationByToken(token); }
-  @Post('auth/invitations/:token/accept') acceptInvitation(@Req() request: IdentityRequest, @Param('token') token: string) { return this.auth.acceptInvitation(this.requireUser(request), token); }
 
   @Post('scheduled-actions') schedule(@Req() request: IdentityRequest, @Body() body: Record<string, any>) { return this.auth.createAction(this.requireUser(request), body); }
   @Get('scheduled-actions') scheduledActions(@Req() request: IdentityRequest) { return this.auth.listActions(this.requireUser(request)); }
   @Get('scheduled-actions/:id') scheduledAction(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.getAction(this.requireUser(request), id); }
-
-  @Post('invitations') async createInvitation(@Req() request: IdentityRequest, @Body() body: Record<string, any>) {
-    const invitation = await this.auth.createInvitation(this.requireUser(request), body);
-    const baseUrl = (process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, '');
-    const result: Record<string, any> = { ...invitation, invitationUrl: `${baseUrl}/?invite=${encodeURIComponent(invitation.token)}` };
-    try { await this.auth.sendInvitationMail(invitation); result.emailStatus = 'sent'; }
-    catch (error) { result.emailStatus = 'failed'; result.emailFailure = error instanceof Error ? error.message : 'Invitation email could not be sent.'; }
-    const { token: _token, senderUserId: _senderId, ...safe } = result; return safe;
-  }
-  @Get('invitations') invitations(@Req() request: IdentityRequest) { return this.auth.listInvitations(this.requireUser(request)); }
-  @Delete('invitations/:id') cancelInvitation(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.cancelInvitation(this.requireUser(request), id); }
 
   @Get('tasks') tasks(@Query() query: Record<string, string>) { return this.service.listTasks(query); }
   @Post('tasks') createTask(@Body() body: Record<string, any>) { return this.service.createTask(body); }

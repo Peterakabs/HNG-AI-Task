@@ -68,7 +68,7 @@ describe('Spectre API (integration)', () => {
   });
 
 
-  it('supports email/password signup, guest data migration, owner-scoped scheduled actions, and invitations', async () => {
+  it('supports email/password signup, guest data migration, and owner-scoped scheduled actions', async () => {
     const guestDevice = randomUUID();
     await request(app.getHttpServer()).post('/api/tasks').set('x-device-id', guestDevice).send({ title: 'Guest task', start: '2026-09-28', due: '2026-09-29T09:30', status: 'To Do', priority: 'Medium' }).expect(201);
     const guest = request.agent(app.getHttpServer());
@@ -84,21 +84,6 @@ describe('Spectre API (integration)', () => {
     const replay = await guest.post('/api/scheduled-actions').set('x-device-id', guestDevice).send(reminder).expect(201);
     expect(replay.body.id).toBe(scheduled.body.id);
     expect((await guest.get('/api/scheduled-actions').set('x-device-id', guestDevice).expect(200)).body).toHaveLength(1);
-    const invitation = await guest.post('/api/invitations').set('x-device-id', guestDevice).send({ recipientName: 'Michael', recipientEmail: 'michael@example.com' }).expect(201);
-    expect(invitation.body).toEqual(expect.objectContaining({ status: 'pending', emailStatus: 'failed' }));
-    expect(invitation.body.token).toBeUndefined();
-    expect(invitation.body.senderUserId).toBeUndefined();
-    const token = new URL(invitation.body.invitationUrl).searchParams.get('invite');
-    expect((await request(app.getHttpServer()).get(`/api/auth/invitations/${token}`).set('x-device-id', randomUUID()).expect(200)).body.senderUserId).toBeUndefined();
-    const invited = request.agent(app.getHttpServer()); const invitedDevice = randomUUID();
-    await invited.post('/api/auth/signup').set('x-device-id', invitedDevice).send({ email: 'michael@example.com', password: 'invited account password', invitationToken: token }).expect(201);
-    expect((await invited.get('/api/auth/me').set('x-device-id', invitedDevice).expect(200)).body.email).toBe('michael@example.com');
-    expect((await invited.get('/api/scheduled-actions').set('x-device-id', invitedDevice).expect(200)).body).toEqual([]);
-    expect((await request(app.getHttpServer()).get(`/api/auth/invitations/${token}`).set('x-device-id', randomUUID()).expect(200)).body.status).toBe('accepted');
-    const invitations = await guest.get('/api/invitations').set('x-device-id', guestDevice).expect(200);
-    expect(invitations.body[0].senderUserId).toBeUndefined();
-    const secondInvitation = await guest.post('/api/invitations').set('x-device-id', guestDevice).send({ recipientName: 'Jamie', recipientEmail: 'jamie@example.com' }).expect(201);
-    await guest.delete(`/api/invitations/${secondInvitation.body.id}`).set('x-device-id', guestDevice).expect(200);
     await guest.post('/api/auth/logout').set('x-device-id', guestDevice).expect(201);
     await guest.get('/api/scheduled-actions').set('x-device-id', guestDevice).expect(401);
     await guest.post('/api/auth/login').set('x-device-id', guestDevice).send({ email: 'creator@example.com', password: 'correct horse battery' }).expect(201);
