@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NestMiddleware, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NestMiddleware, UnauthorizedException } from '@nestjs/common';
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -6,12 +6,14 @@ import type { NextFunction, Request, Response } from 'express';
 import { JsonStore, ScopeContext } from './store';
 
 type User = { id: string; email: string; passwordHash: string; createdAt: number; updatedAt: number };
-type AuthData = { users: User[]; scheduledActions: Record<string, any>[] };
+type GuestAccount = { id: string; deviceId: string; createdAt: number };
+type AuthData = { users: User[]; scheduledActions: Record<string, any>[]; guestAccounts: GuestAccount[] };
 export type RequestIdentity = { type: 'user'; id: string } | { type: 'guest'; deviceId: string };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
   private readonly path = process.env.SPECTRE_AUTH_FILE || join(process.cwd(), '.data', 'spectre-auth.json');
   private readonly secret = process.env.SPECTRE_SESSION_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'development-only-spectre-secret-change-me');
   constructor(private readonly store: JsonStore) {}
@@ -23,9 +25,27 @@ export class AuthService {
     return { type: 'user', id: userId };
   }
 
-  createGuestIdentity(value: unknown): RequestIdentity {
+  createGuestIdentity(value: unknown): Extract<RequestIdentity, { type: 'guest' }> {
     if (typeof value !== 'string' || !UUID.test(value)) throw new BadRequestException('A valid device ID is required.');
     return { type: 'guest', deviceId: value.toLowerCase() };
+  }
+
+  ensureGuestAccount(deviceId: string) {
+    const guestIdentity = this.createGuestIdentity(deviceId);
+    const canonicalDeviceId = guestIdentity.deviceId;
+    const deviceKey = canonicalDeviceId.slice(0, 8);
+    this.logger.log(`Looking up guest account for device ${deviceKey}…`);
+    const data = this.read();
+    const existing = data.guestAccounts.find((guest) => guest.deviceId === canonicalDeviceId);
+    if (existing) {
+      this.logger.log(`Reusing guest account ${existing.id} for device ${deviceKey}.`);
+      return { guestUserId: existing.id, created: false };
+    }
+    const guest: GuestAccount = { id: randomBytes(16).toString('hex'), deviceId: canonicalDeviceId, createdAt: Date.now() };
+    data.guestAccounts.push(guest);
+    this.write(data);
+    this.logger.log(`Created guest account ${guest.id} for device ${deviceKey}.`);
+    return { guestUserId: guest.id, created: true };
   }
 
   async register(input: Record<string, any>, deviceId: string) {
@@ -77,9 +97,9 @@ export class AuthService {
   }
 
   private read(): AuthData {
-    if (!existsSync(this.path)) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); return { users: [], scheduledActions: [] }; }
+    if (!existsSync(this.path)) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); return { users: [], scheduledActions: [], guestAccounts: [] }; }
     const data = JSON.parse(readFileSync(this.path, 'utf8'));
-    return { users: data.users || [], scheduledActions: data.scheduledActions || [] };
+    return { users: data.users || [], scheduledActions: data.scheduledActions || [], guestAccounts: data.guestAccounts || [] };
   }
   write(data: AuthData) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); const temporary = `${this.path}.tmp`; writeFileSync(temporary, JSON.stringify(data, null, 2)); renameSync(temporary, this.path); }
   claimDueActions() {
