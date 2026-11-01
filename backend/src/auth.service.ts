@@ -1,81 +1,154 @@
-import { BadRequestException, Injectable, Logger, NestMiddleware, UnauthorizedException } from '@nestjs/common';
-import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { BadRequestException, Injectable, Logger, NestMiddleware, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { JsonStore, ScopeContext } from './store';
+import { SupabaseStore, ScopeContext } from './store';
+import { SupabaseService } from './supabase.service';
 
-type User = { id: string; email: string; passwordHash: string; createdAt: number; updatedAt: number };
-type GuestAccount = { id: string; deviceId: string; createdAt: number };
-type AuthData = { users: User[]; scheduledActions: Record<string, any>[]; guestAccounts: GuestAccount[] };
-export type RequestIdentity = { type: 'user'; id: string } | { type: 'guest'; deviceId: string };
+type SessionCookie = { access_token: string; refresh_token: string };
+type GuestAccount = { id: string; device_id: string; created_at: string };
+export type RequestIdentity = { type: 'user'; id: string; email?: string } | { type: 'guest'; deviceId: string; guestUserId?: string };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
-  private readonly path = process.env.SPECTRE_AUTH_FILE || join(process.cwd(), '.data', 'spectre-auth.json');
-  private readonly secret = process.env.SPECTRE_SESSION_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'development-only-spectre-secret-change-me');
-  constructor(private readonly store: JsonStore) {}
+  constructor(private readonly supabase: SupabaseService, private readonly store: SupabaseStore) {}
 
-  identityFromCookie(cookieHeader: string | undefined): RequestIdentity | undefined {
-    const token = cookieHeader?.split(';').map((item) => item.trim()).find((item) => item.startsWith('spectre_session='))?.slice('spectre_session='.length);
-    if (!token) return undefined;
-    const userId = this.verifySession(decodeURIComponent(token));
-    return { type: 'user', id: userId };
+  async identityFromCookie(cookieHeader: string | undefined) {
+    const raw = this.readCookie(cookieHeader, 'spectre_session');
+    if (!raw) return undefined;
+    let bundle: SessionCookie;
+    try { bundle = JSON.parse(Buffer.from(decodeURIComponent(raw), 'base64url').toString('utf8')); }
+    catch { throw new UnauthorizedException('Invalid session. Please log in again.'); }
+    if (!bundle.access_token || !bundle.refresh_token) throw new UnauthorizedException('Invalid session. Please log in again.');
+    let { data, error } = await this.supabase.auth.getUser(bundle.access_token);
+    let refreshed: SessionCookie | undefined;
+    if (error) {
+      const result = await this.supabase.newClient().auth.refreshSession({ refresh_token: bundle.refresh_token });
+      if (result.error || !result.data.session) throw new UnauthorizedException('Your session expired. Please log in again.');
+      data = { user: result.data.user! }; error = null;
+      refreshed = { access_token: result.data.session.access_token, refresh_token: result.data.session.refresh_token };
+    }
+    if (!data.user) throw new UnauthorizedException('This account session is no longer valid. Please log in again.');
+    return { identity: { type: 'user' as const, id: data.user.id, email: data.user.email }, session: refreshed && this.encodeSession(refreshed) };
   }
 
   createGuestIdentity(value: unknown): Extract<RequestIdentity, { type: 'guest' }> {
-    if (typeof value !== 'string' || !UUID.test(value)) throw new BadRequestException('A valid device ID is required.');
+    if (typeof value !== 'string' || !UUID.test(value)) throw new BadRequestException('A valid installation ID is required.');
     return { type: 'guest', deviceId: value.toLowerCase() };
   }
 
-  ensureGuestAccount(deviceId: string) {
-    const guestIdentity = this.createGuestIdentity(deviceId);
-    const canonicalDeviceId = guestIdentity.deviceId;
-    const deviceKey = canonicalDeviceId.slice(0, 8);
-    this.logger.log(`Looking up guest account for device ${deviceKey}…`);
-    const data = this.read();
-    const existing = data.guestAccounts.find((guest) => guest.deviceId === canonicalDeviceId);
-    if (existing) {
-      this.logger.log(`Reusing guest account ${existing.id} for device ${deviceKey}.`);
-      return { guestUserId: existing.id, created: false };
-    }
-    const guest: GuestAccount = { id: randomBytes(16).toString('hex'), deviceId: canonicalDeviceId, createdAt: Date.now() };
-    data.guestAccounts.push(guest);
-    this.write(data);
-    this.logger.log(`Created guest account ${guest.id} for device ${deviceKey}.`);
-    return { guestUserId: guest.id, created: true };
+  guestCookieId(cookieHeader: string | undefined) { return this.readCookie(cookieHeader, 'guest_user_id'); }
+
+  async getGuestAccount(id: string): Promise<GuestAccount | undefined> {
+    if (!UUID.test(id)) return undefined;
+    const { data, error } = await this.supabase.db.from('guest_accounts').select('id,device_id,created_at').eq('id', id).maybeSingle();
+    if (error) throw new ServiceUnavailableException(`Could not load guest account: ${error.message}`);
+    return data || undefined;
   }
 
-  async register(input: Record<string, any>, deviceId: string) {
+  async ensureGuestAccount(deviceId: string) {
+    const canonical = this.createGuestIdentity(deviceId).deviceId;
+    const { data: existing, error: lookupError } = await this.supabase.db.from('guest_accounts').select('id').eq('device_id', canonical).maybeSingle();
+    if (lookupError) throw new ServiceUnavailableException(`Could not look up guest account: ${lookupError.message}`);
+    if (existing) return { guestUserId: existing.id as string, created: false };
+    const { data, error } = await this.supabase.db.from('guest_accounts').insert({ id: randomUUID(), device_id: canonical }).select('id').single();
+    if (error?.code === '23505') {
+      const { data: concurrent, error: retryError } = await this.supabase.db.from('guest_accounts').select('id').eq('device_id', canonical).single();
+      if (retryError) throw new ServiceUnavailableException(`Could not reuse guest account: ${retryError.message}`);
+      return { guestUserId: concurrent.id as string, created: false };
+    }
+    if (error) throw new ServiceUnavailableException(`Could not create guest account: ${error.message}`);
+    this.logger.log(`Created guest account ${data.id} for device ${canonical.slice(0, 8)}.`);
+    return { guestUserId: data.id as string, created: true };
+  }
+
+  async register(input: Record<string, any>) {
     const email = this.cleanEmail(input.email); const password = this.cleanPassword(input.password);
-    const data = this.read();
-    if (data.users.some((user) => user.email === email)) throw new BadRequestException('An account with this email already exists.');
-    const user: User = { id: randomBytes(16).toString('hex'), email, passwordHash: this.hashPassword(password), createdAt: Date.now(), updatedAt: Date.now() };
-    data.users.push(user);
-    this.write(data);
-    this.store.copyGuestToAccount(deviceId, user.id);
-    return { user: this.publicUser(user), session: this.issueSession(user.id) };
-  }
-
-  login(input: Record<string, any>) {
-    const email = this.cleanEmail(input.email); const password = this.cleanPassword(input.password, false);
-    const user = this.read().users.find((candidate) => candidate.email === email);
-    if (!user || !this.passwordMatches(password, user.passwordHash)) throw new UnauthorizedException('Email or password is incorrect.');
-    return { user: this.publicUser(user), session: this.issueSession(user.id) };
-  }
-
-  getUser(id: string) { const user = this.read().users.find((candidate) => candidate.id === id); return user ? this.publicUser(user) : null; }
-  findUserByEmail(email: string) { const user = this.read().users.find((candidate) => candidate.email === email.toLowerCase().trim()); return user ? this.publicUser(user) : null; }
-
-  createAction(userId: string, input: Record<string, any>) {
-    if (input.confirmed !== true) throw new BadRequestException('Confirm the reminder before scheduling it.');
-    const data = this.read();
-    if (typeof input.clientRequestId === 'string') {
-      const prior = data.scheduledActions.find((action) => action.creatorUserId === userId && action.clientRequestId === input.clientRequestId);
-      if (prior) return prior;
+    const { data, error } = await this.supabase.auth.admin.createUser({ email, password, email_confirm: true });
+    if (error) {
+      if (/already|registered|exists/i.test(error.message)) throw new BadRequestException('An account with this email already exists.');
+      throw new ServiceUnavailableException(`Could not create account: ${error.message}`);
     }
+    const signedIn = await this.supabase.newClient().auth.signInWithPassword({ email, password });
+    if (signedIn.error || !signedIn.data.session || !data.user) throw new ServiceUnavailableException('Account created, but sign-in could not be started. Please log in.');
+    return { user: this.publicUser(data.user), session: this.encodeSession(signedIn.data.session) };
+  }
+
+  async login(input: Record<string, any>) {
+    const email = this.cleanEmail(input.email); const password = this.cleanPassword(input.password, false);
+    const { data, error } = await this.supabase.newClient().auth.signInWithPassword({ email, password });
+    if (error || !data.user || !data.session) throw new UnauthorizedException('Email or password is incorrect.');
+    return { user: this.publicUser(data.user), session: this.encodeSession(data.session) };
+  }
+
+  async logout(cookieHeader?: string) {
+    const raw = this.readCookie(cookieHeader, 'spectre_session');
+    if (!raw) return;
+    try {
+      const session = JSON.parse(Buffer.from(decodeURIComponent(raw), 'base64url').toString('utf8')) as SessionCookie;
+      if (session.access_token) await this.supabase.auth.admin.signOut(session.access_token, 'local');
+    } catch (error) { this.logger.warn(`Session revoke failed during logout: ${error instanceof Error ? error.message : 'unknown error'}`); }
+  }
+
+  async getUser(id: string) {
+    const { data, error } = await this.supabase.auth.admin.getUserById(id);
+    if (error) return null;
+    return this.publicUser(data.user);
+  }
+
+  async transferGuestData(userId: string, guestUserId: string, confirmed: boolean) {
+    if (!confirmed) throw new BadRequestException('Confirm the guest data transfer before continuing.');
+    if (!(await this.getUser(userId))) throw new UnauthorizedException('Authenticated account not found.');
+    const guest = await this.getGuestAccount(guestUserId);
+    if (!guest) throw new BadRequestException('The guest account is no longer available.');
+    const source = await this.store.read(`guest:${guest.device_id}`);
+    const destination = await this.store.read(`user:${userId}`);
+    const taskFingerprint = (task: Record<string, any>) => `${String(task.title || '').trim().toLowerCase()}\u0000${task.start || ''}\u0000${task.due || ''}`;
+    const knownTaskIds = new Set(destination.tasks.map((task) => task.id).filter(Boolean));
+    const knownTasks = new Set(destination.tasks.map(taskFingerprint));
+    const tasks = source.tasks.filter((task) => {
+      const fingerprint = taskFingerprint(task);
+      if ((task.id && knownTaskIds.has(task.id)) || knownTasks.has(fingerprint)) return false;
+      if (task.id) knownTaskIds.add(task.id); knownTasks.add(fingerprint); return true;
+    });
+    const noteFingerprint = (note: Record<string, any>) => `${String(note.title || '').trim().toLowerCase()}\u0000${String(note.text || '').trim()}`;
+    const knownNoteIds = new Set(destination.notes.map((note) => note.id).filter(Boolean));
+    const knownNotes = new Set(destination.notes.map(noteFingerprint));
+    const notes = source.notes.filter((note) => {
+      const fingerprint = noteFingerprint(note);
+      if ((note.id && knownNoteIds.has(note.id)) || knownNotes.has(fingerprint)) return false;
+      if (note.id) knownNoteIds.add(note.id); knownNotes.add(fingerprint); return true;
+    });
+    const foldersMerged = source.folders.filter((item) => !destination.folders.includes(item)).length;
+    const tagsMerged = source.tags.filter((item) => !destination.tags.includes(item)).length;
+    destination.tasks = [...destination.tasks, ...tasks]; destination.notes = [...destination.notes, ...notes];
+    destination.folders = [...new Set([...destination.folders, ...source.folders])];
+    destination.tags = [...new Set([...destination.tags, ...source.tags])];
+    await this.store.write(destination, `user:${userId}`);
+    return { tasksTransferred: tasks.length, notesTransferred: notes.length, foldersMerged, tagsMerged };
+  }
+
+  async requestPasswordReset(value: unknown) {
+    const email = this.cleanEmail(value);
+    const redirectTo = `${(process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, '')}/?type=recovery`;
+    const { error } = await this.supabase.auth.resetPasswordForEmail(email, { redirectTo });
+    if (error) throw new ServiceUnavailableException(`Could not send password reset email: ${error.message}`);
+    return { message: 'If an account exists for that email, a password reset link has been sent.' };
+  }
+
+  async resetPassword(tokenValue: unknown, passwordValue: unknown) {
+    if (typeof tokenValue !== 'string' || tokenValue.length > 4096) throw new BadRequestException('This password reset link is invalid or expired. Request a new one.');
+    const password = this.cleanPassword(passwordValue);
+    const { data, error } = await this.supabase.auth.getUser(tokenValue);
+    if (error || !data.user) throw new BadRequestException('This password reset link is invalid or expired. Request a new one.');
+    const update = await this.supabase.auth.admin.updateUserById(data.user.id, { password });
+    if (update.error) throw new ServiceUnavailableException(`Could not update password: ${update.error.message}`);
+    return { message: 'Password updated. You can now log in with your new password.' };
+  }
+
+  async createAction(userId: string, input: Record<string, any>) {
+    if (input.confirmed !== true) throw new BadRequestException('Confirm the reminder before scheduling it.');
     const recipientName = this.required(input.recipientName, 'Recipient name');
     const recipientEmail = this.cleanEmail(input.recipientEmail);
     const subject = this.required(input.subject, 'Subject'); const message = this.required(input.message, 'Message');
@@ -83,11 +156,40 @@ export class AuthService {
     if (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now()) throw new BadRequestException('Reminder time must be in the future.');
     const timezone = this.required(input.timezone, 'Timezone');
     try { new Intl.DateTimeFormat('en', { timeZone: timezone }); } catch { throw new BadRequestException('A valid timezone is required.'); }
-    const action = { id: randomBytes(16).toString('hex'), clientRequestId: typeof input.clientRequestId === 'string' ? input.clientRequestId.slice(0, 100) : null, creatorUserId: userId, recipientName, recipientEmail, recipientUserId: data.users.find((user) => user.email === recipientEmail)?.id || null, subject, message, scheduledAt, timezone, status: 'scheduled', createdAt: Date.now(), failureReason: null };
-    data.scheduledActions.push(action); this.write(data); return action;
+    const clientRequestId = typeof input.clientRequestId === 'string' ? input.clientRequestId.slice(0, 100) : null;
+    if (clientRequestId) {
+      const { data: prior, error } = await this.supabase.db.from('scheduled_actions').select('*').eq('creator_user_id', userId).eq('client_request_id', clientRequestId).maybeSingle();
+      if (error) throw new ServiceUnavailableException(`Could not check reminder: ${error.message}`);
+      if (prior) return this.actionFromRow(prior);
+    }
+    const { data, error } = await this.supabase.db.from('scheduled_actions').insert({ creator_user_id: userId, client_request_id: clientRequestId, recipient_name: recipientName, recipient_email: recipientEmail, subject, message, scheduled_at: new Date(scheduledAt).toISOString(), timezone, status: 'scheduled' }).select('*').single();
+    if (error) {
+      if (error.code === '23505' && clientRequestId) return this.getActionByRequestId(userId, clientRequestId);
+      throw new ServiceUnavailableException(`Could not schedule reminder: ${error.message}`);
+    }
+    return this.actionFromRow(data);
   }
-  listActions(userId: string) { return this.read().scheduledActions.filter((action) => action.creatorUserId === userId).sort((a, b) => a.scheduledAt - b.scheduledAt); }
-  getAction(userId: string, id: string) { const action = this.read().scheduledActions.find((item) => item.id === id && item.creatorUserId === userId); if (!action) throw new UnauthorizedException('Scheduled action not found.'); return action; }
+
+  async listActions(userId: string) {
+    const { data, error } = await this.supabase.db.from('scheduled_actions').select('*').eq('creator_user_id', userId).order('scheduled_at', { ascending: true });
+    if (error) throw new ServiceUnavailableException(`Could not load reminders: ${error.message}`);
+    return data.map((row) => this.actionFromRow(row));
+  }
+  async getAction(userId: string, id: string) {
+    const { data, error } = await this.supabase.db.from('scheduled_actions').select('*').eq('id', id).eq('creator_user_id', userId).maybeSingle();
+    if (error) throw new ServiceUnavailableException(`Could not load reminder: ${error.message}`);
+    if (!data) throw new UnauthorizedException('Scheduled action not found.');
+    return this.actionFromRow(data);
+  }
+  async claimDueActions() {
+    const { data, error } = await this.supabase.db.rpc('claim_due_scheduled_actions', { p_limit: 50 });
+    if (error) throw new ServiceUnavailableException(`Could not claim reminders: ${error.message}`);
+    return (data || []).map((row: any) => this.actionFromRow(row));
+  }
+  async finishAction(id: string, errorMessage?: string) {
+    const { error } = await this.supabase.db.from('scheduled_actions').update({ status: errorMessage ? 'failed' : 'completed', failure_reason: errorMessage || null, completed_at: new Date().toISOString() }).eq('id', id).eq('status', 'sending');
+    if (error) this.logger.error(`Could not finish scheduled action ${id}: ${error.message}`);
+  }
 
   async sendEmail(to: string, subject: string, text: string) {
     const key = process.env.SENDGRID_API_KEY; const from = process.env.EMAIL_FROM;
@@ -96,41 +198,21 @@ export class AuthService {
     if (!response.ok) throw new Error(`Email provider rejected the message (${response.status}).`);
   }
 
-  private read(): AuthData {
-    if (!existsSync(this.path)) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); return { users: [], scheduledActions: [], guestAccounts: [] }; }
-    const data = JSON.parse(readFileSync(this.path, 'utf8'));
-    return { users: data.users || [], scheduledActions: data.scheduledActions || [], guestAccounts: data.guestAccounts || [] };
+  encodeSession(session: { access_token: string; refresh_token: string }) { return Buffer.from(JSON.stringify({ access_token: session.access_token, refresh_token: session.refresh_token })).toString('base64url'); }
+  private async getActionByRequestId(userId: string, clientRequestId: string) {
+    const { data, error } = await this.supabase.db.from('scheduled_actions').select('*').eq('creator_user_id', userId).eq('client_request_id', clientRequestId).single();
+    if (error) throw new ServiceUnavailableException(`Could not retrieve reminder: ${error.message}`);
+    return this.actionFromRow(data);
   }
-  write(data: AuthData) { const directory = dirname(this.path); if (!existsSync(directory)) mkdirSync(directory, { recursive: true }); const temporary = `${this.path}.tmp`; writeFileSync(temporary, JSON.stringify(data, null, 2)); renameSync(temporary, this.path); }
-  claimDueActions() {
-    const data = this.read(); const now = Date.now();
-    const due = data.scheduledActions.filter((action) => action.status === 'scheduled' && action.scheduledAt <= now);
-    due.forEach((action) => { action.status = 'sending'; action.attemptedAt = now; });
-    if (due.length) this.write(data);
-    return due;
-  }
-  finishAction(id: string, error?: string) {
-    const data = this.read(); const action = data.scheduledActions.find((item) => item.id === id && item.status === 'sending');
-    if (!action) return; action.status = error ? 'failed' : 'completed'; action.failureReason = error || null; action.completedAt = Date.now(); this.write(data);
-  }
-
-  private publicUser(user: User) { return { id: user.id, email: user.email, createdAt: user.createdAt, updatedAt: user.updatedAt }; }
+  private actionFromRow(row: any) { return { id: row.id, clientRequestId: row.client_request_id, creatorUserId: row.creator_user_id, recipientName: row.recipient_name, recipientEmail: row.recipient_email, recipientUserId: null, subject: row.subject, message: row.message, scheduledAt: Date.parse(row.scheduled_at), timezone: row.timezone, status: row.status, createdAt: Date.parse(row.created_at), failureReason: row.failure_reason, attemptedAt: row.attempted_at ? Date.parse(row.attempted_at) : undefined, completedAt: row.completed_at ? Date.parse(row.completed_at) : undefined }; }
+  private publicUser(user: { id: string; email?: string; created_at?: string; updated_at?: string }) { return { id: user.id, email: user.email, createdAt: user.created_at ? Date.parse(user.created_at) : Date.now(), updatedAt: user.updated_at ? Date.parse(user.updated_at) : Date.now() }; }
   private cleanEmail(value: unknown) { if (typeof value !== 'string' || value.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())) throw new BadRequestException('A valid email address is required.'); return value.trim().toLowerCase(); }
   private cleanPassword(value: unknown, enforce = true) { if (typeof value !== 'string' || (enforce && value.length < 8) || value.length > 256) throw new BadRequestException(enforce ? 'Password must be between 8 and 256 characters.' : 'Password is required.'); return value; }
   private required(value: unknown, label: string) { if (typeof value !== 'string' || !value.trim() || value.length > 2000) throw new BadRequestException(`${label} is required.`); return value.trim(); }
-  private hashPassword(password: string) { const salt = randomBytes(16).toString('hex'); return `scrypt:${salt}:${scryptSync(password, salt, 64).toString('hex')}`; }
-  private passwordMatches(password: string, stored: string) { const [, salt, expectedHex] = stored.split(':'); const expected = Buffer.from(expectedHex || '', 'hex'); const actual = scryptSync(password, salt || '', 64); return expected.length === actual.length && timingSafeEqual(expected, actual); }
-  private issueSession(userId: string) {
-    if (!this.secret) throw new Error('SPECTRE_SESSION_SECRET must be configured in production.');
-    const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + 7 * 24 * 60 * 60 * 1000 })).toString('base64url');
-    return `${payload}.${createHmac('sha256', this.secret).update(payload).digest('base64url')}`;
-  }
-  private verifySession(token: string) {
-    if (!this.secret) throw new UnauthorizedException('Session validation is unavailable.');
-    const [payload, signature] = token.split('.'); const expected = createHmac('sha256', this.secret).update(payload || '').digest();
-    let actual: Buffer; try { actual = Buffer.from(signature || '', 'base64url'); } catch { throw new UnauthorizedException('Invalid session.'); }
-    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) throw new UnauthorizedException('Invalid session.');
-    try { const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString()); if (!parsed.sub || parsed.exp <= Date.now()) throw new Error(); return parsed.sub as string; } catch { throw new UnauthorizedException('Session expired.'); }
+  private readCookie(header: string | undefined, name: string) {
+    const value = header?.split(';').map((item) => item.trim()).find((item) => item.startsWith(`${name}=`))?.slice(name.length + 1);
+    if (value === undefined) return undefined;
+    try { return decodeURIComponent(value); } catch { return ''; }
   }
 }
 
@@ -138,12 +220,29 @@ export class AuthService {
 export class IdentityMiddleware implements NestMiddleware {
   constructor(private readonly auth: AuthService, private readonly scopes: ScopeContext) {}
   use(request: Request & { identity?: RequestIdentity }, response: Response, next: NextFunction) {
-    if (request.path === '/api/health') return next();
-    try {
-      const identity = this.auth.identityFromCookie(request.headers.cookie);
-      request.identity = identity || this.auth.createGuestIdentity(request.headers['x-device-id']);
-      const scope = request.identity.type === 'user' ? `user:${request.identity.id}` : `guest:${request.identity.deviceId}`;
-      this.scopes.run(scope, next);
-    } catch (error) { next(error); }
+    void (async () => {
+      if (request.path === '/api/health' || request.path === '/api/health/supabase') return next();
+      try {
+        const session = await this.auth.identityFromCookie(request.headers.cookie);
+        let identity: RequestIdentity | undefined = session?.identity;
+        if (session?.session) response.cookie('spectre_session', session.session, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 24 * 60 * 60 * 1000 });
+        if (!identity) {
+          const guestCookieId = this.auth.guestCookieId(request.headers.cookie);
+          const guestAccount = guestCookieId ? await this.auth.getGuestAccount(guestCookieId) : undefined;
+          if (guestAccount) identity = { type: 'guest', deviceId: guestAccount.device_id, guestUserId: guestAccount.id };
+          else {
+            if (guestCookieId !== undefined) response.clearCookie('guest_user_id', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' });
+            const deviceId = request.headers['x-device-id'];
+            if (deviceId !== undefined) identity = this.auth.createGuestIdentity(deviceId);
+            else if (request.path === '/api/auth/guest') identity = this.auth.createGuestIdentity(randomUUID());
+            else if (request.path === '/api/auth/me') return next();
+            else throw new BadRequestException('A guest account cookie is required.');
+          }
+        }
+        request.identity = identity;
+        const scope = identity.type === 'user' ? `user:${identity.id}` : `guest:${identity.deviceId}`;
+        this.scopes.run(scope, next);
+      } catch (error) { next(error); }
+    })();
   }
 }

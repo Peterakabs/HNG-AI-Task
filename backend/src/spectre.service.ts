@@ -1,15 +1,15 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { JsonStore, SpectreData } from './store';
+import { SupabaseStore, SpectreData } from './store';
 
 const priorities = ['High', 'Medium', 'Low'];
 const statuses = ['To Do', 'In Progress', 'Completed'];
 
 @Injectable()
 export class SpectreService {
-  constructor(private readonly store: JsonStore) {}
+  constructor(private readonly store: SupabaseStore) {}
 
-  listTasks(query: Record<string, string | undefined> = {}) {
-    const data = this.store.read();
+  async listTasks(query: Record<string, string | undefined> = {}) {
+    const data = await this.store.read();
     let tasks = [...data.tasks];
     if (query.status) tasks = tasks.filter((task) => task.status === query.status);
     if (query.priority) tasks = tasks.filter((task) => task.priority === query.priority);
@@ -25,9 +25,9 @@ export class SpectreService {
     return tasks;
   }
 
-  createTask(input: Record<string, any>) {
+  async createTask(input: Record<string, any>) {
     this.validateTask(input, true);
-    const data = this.store.read();
+    const data = await this.store.read();
     const task = {
       id: this.store.id(), title: input.title.trim(), description: input.description?.trim() || '',
       start: input.start, due: input.due, status: input.status, priority: input.priority,
@@ -39,14 +39,14 @@ export class SpectreService {
     };
     data.tasks.push(task);
     this.recordTags(data, task.tags);
-    this.store.write(data);
+    await this.store.write(data);
     return task;
   }
 
-  getTask(id: string) { return this.requireTask(this.store.read(), id); }
+  async getTask(id: string) { return this.requireTask(await this.store.read(), id); }
 
-  updateTask(id: string, input: Record<string, any>) {
-    const data = this.store.read();
+  async updateTask(id: string, input: Record<string, any>) {
+    const data = await this.store.read();
     const task = this.requireTask(data, id);
     const wasCompleted = task.status === 'Completed';
     const merged = { ...task, ...input };
@@ -61,78 +61,78 @@ export class SpectreService {
       recurringTask = this.nextOccurrence(task, data.tasks.length);
       if (recurringTask) data.tasks.push(recurringTask);
     }
-    this.store.write(data);
+    await this.store.write(data);
     return { task, recurringTask };
   }
 
-  deleteTask(id: string) {
-    const data = this.store.read();
+  async deleteTask(id: string) {
+    const data = await this.store.read();
     const task = this.requireTask(data, id);
     data.tasks = data.tasks.filter((item) => item.id !== id);
-    this.store.write(data);
+    await this.store.write(data);
     return task;
   }
 
-  reorderTasks(ids: string[]) {
-    const data = this.store.read();
+  async reorderTasks(ids: string[]) {
+    const data = await this.store.read();
     if (!Array.isArray(ids) || ids.length !== data.tasks.length || new Set(ids).size !== ids.length || ids.some((id) => !data.tasks.some((task) => task.id === id))) {
       throw new BadRequestException('Order must contain every task id exactly once.');
     }
     const byId = new Map(data.tasks.map((task) => [task.id, task]));
     ids.forEach((id, order) => { byId.get(id)!.order = order; });
     data.tasks.sort((a, b) => a.order - b.order);
-    this.store.write(data);
+    await this.store.write(data);
     return data.tasks;
   }
 
-  listFolders() { return this.store.read().folders; }
-  createFolder(name: string) {
+  async listFolders() { return (await this.store.read()).folders; }
+  async createFolder(name: string) {
     const clean = this.requireName(name, 'Folder');
-    const data = this.store.read();
+    const data = await this.store.read();
     if (data.folders.some((folder) => folder.toLowerCase() === clean.toLowerCase())) throw new BadRequestException('Folder already exists.');
-    data.folders.push(clean); this.store.write(data); return { name: clean };
+    data.folders.push(clean); await this.store.write(data); return { name: clean };
   }
-  deleteFolder(name: string) {
-    const data = this.store.read();
+  async deleteFolder(name: string) {
+    const data = await this.store.read();
     if (!data.folders.includes(name)) throw new NotFoundException('Folder not found.');
     data.folders = data.folders.filter((folder) => folder !== name);
     data.tasks.forEach((task) => { if (task.folder === name) task.folder = ''; });
-    this.store.write(data); return { name };
+    await this.store.write(data); return { name };
   }
 
-  listTags() { return this.store.read().tags; }
-  createTag(name: string) {
+  async listTags() { return (await this.store.read()).tags; }
+  async createTag(name: string) {
     const clean = this.requireName(name, 'Tag');
-    const data = this.store.read();
+    const data = await this.store.read();
     if (data.tags.some((tag) => tag.toLowerCase() === clean.toLowerCase())) throw new BadRequestException('Tag already exists.');
-    data.tags.push(clean); this.store.write(data); return { name: clean };
+    data.tags.push(clean); await this.store.write(data); return { name: clean };
   }
 
-  listNotes() { return this.store.read().notes.sort((a, b) => b.createdAt - a.createdAt); }
-  createNote(input: Record<string, any>) {
+  async listNotes() { return (await this.store.read()).notes.sort((a, b) => b.createdAt - a.createdAt); }
+  async createNote(input: Record<string, any>) {
     if (typeof input.text !== 'string' || !input.text.trim()) throw new BadRequestException('Note text is required.');
-    const data = this.store.read();
+    const data = await this.store.read();
     const note = { id: this.store.id(), title: String(input.title || '').trim(), text: input.text.trim(), createdAt: Date.now() };
-    data.notes.push(note); this.store.write(data); return note;
+    data.notes.push(note); await this.store.write(data); return note;
   }
-  updateNote(id: string, input: Record<string, any>) {
-    const data = this.store.read(); const note = data.notes.find((item) => item.id === id);
+  async updateNote(id: string, input: Record<string, any>) {
+    const data = await this.store.read(); const note = data.notes.find((item) => item.id === id);
     if (!note) throw new NotFoundException('Note not found.');
     if (input.text !== undefined && (typeof input.text !== 'string' || !input.text.trim())) throw new BadRequestException('Note text cannot be empty.');
     if (input.title !== undefined) note.title = String(input.title).trim();
     if (input.text !== undefined) note.text = input.text.trim();
-    this.store.write(data); return note;
+    await this.store.write(data); return note;
   }
-  deleteNote(id: string) {
-    const data = this.store.read(); const note = data.notes.find((item) => item.id === id);
+  async deleteNote(id: string) {
+    const data = await this.store.read(); const note = data.notes.find((item) => item.id === id);
     if (!note) throw new NotFoundException('Note not found.');
-    data.notes = data.notes.filter((item) => item.id !== id); this.store.write(data); return note;
+    data.notes = data.notes.filter((item) => item.id !== id); await this.store.write(data); return note;
   }
 
-  getProfile() { const { username } = this.store.read(); return { username }; }
-  updateProfile(input: Record<string, any>) {
+  async getProfile() { const { username } = await this.store.read(); return { username }; }
+  async updateProfile(input: Record<string, any>) {
     const username = this.requireName(input.username, 'Username');
-    const data = this.store.read(); data.username = username; this.store.write(data); return { username };
+    const data = await this.store.read(); data.username = username; await this.store.write(data); return { username };
   }
 
   private requireTask(data: SpectreData, id: string) {
