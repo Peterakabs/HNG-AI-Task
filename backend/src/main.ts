@@ -1,6 +1,11 @@
 import 'reflect-metadata';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+
+const backendEnv = resolve(__dirname, '../.env');
+if (existsSync(backendEnv)) process.loadEnvFile(backendEnv);
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);

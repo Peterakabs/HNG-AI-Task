@@ -15,6 +15,7 @@ html[data-theme="dark"]{color-scheme:dark;--bg:#151821;--paper:#202532;--ink:#f0
 .auth-actions .app-button{width:100%;min-width:0;white-space:nowrap}
 .auth-actions:has(> .app-button:only-child){grid-template-columns:minmax(160px,240px);justify-content:center}
 .auth-copy{margin:0 0 14px}
+.text-link{margin-top:10px;padding:4px 0;border:0;background:transparent;color:var(--blue);font-size:12px;font-weight:700}
 .feedback-copy{font-size:13px;line-height:1.6;margin:0 0 18px}
 .feedback-copy.success{color:#28734d}
 .feedback-copy.error{color:#b43d3d}
@@ -39,3 +40,73 @@ html[data-theme="dark"] .feedback-copy.error{color:#ff9292}
 @keyframes splash-progress{from{transform:translateX(-110%)}to{transform:translateX(280%)}}
 @keyframes button-spin{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.splash-mark,.splash-name,.splash-caption,.splash-progress::after,.button-spinner{animation-duration:.01ms;animation-iteration-count:1}}
+
+/* Responsive layout refinements */
+html,body,#root{max-width:100%;overflow-x:clip}
+.mobile-menu,.sidebar-scrim{display:none}
+.top-actions{flex-wrap:nowrap}
+.primary-add{white-space:nowrap;word-break:keep-all;flex:none}
+.task,.note-card,.calendar-grid,.calendar-view,.toolbar,.filters{min-width:0;max-width:100%}
+@media(max-width:1100px){
+  .app-shell{grid-template-columns:220px minmax(0,1fr)}
+  .center{padding:22px clamp(14px,2.6vw,26px) 40px}
+  .topline{align-items:flex-start;flex-wrap:wrap;gap:12px}
+  .top-heading{flex:1 1 100%}
+  .top-actions{flex:1 1 100%;width:100%;justify-content:flex-start;flex-wrap:wrap;white-space:normal}
+  .search-input{width:min(240px,35vw)}
+}
+@media(max-width:800px){
+  .app-shell{display:block;min-height:100dvh}
+  .sidebar{position:fixed;z-index:42;left:0;top:0;bottom:0;width:min(320px,86vw);height:100dvh;transform:translateX(-105%);transition:transform .22s;box-shadow:12px 0 35px #0002}
+  .nav-open .sidebar{transform:translateX(0)}
+  .sidebar-scrim{display:block;position:fixed;inset:0;z-index:41;width:100%;height:100%;padding:0;border:0;border-radius:0;background:#10131b80}
+  .mobile-menu{display:inline-flex;align-items:center;justify-content:center}
+  .center{padding:20px 20px 40px}
+  .topline{flex-wrap:wrap}
+  .top-heading{width:100%}
+  .top-actions{width:100%;flex:1 1 100%;justify-content:flex-start;flex-wrap:wrap;white-space:normal}
+  .toolbar{align-items:flex-start;flex-wrap:wrap}
+  .toolbar-actions{width:100%;flex:1 1 100%}
+  .search-input{flex:1;width:auto;min-width:0}
+  .filters{display:flex;flex-wrap:wrap}
+  .filters select{flex:1 1 145px;max-width:calc(50% - 4px)}
+  .task-quick{opacity:1}
+  .detail-page{padding:22px}
+  .detail-page-header{gap:10px;flex-wrap:wrap}
+  .detail-page-header>div{flex-wrap:wrap}
+}
+@media(max-width:560px){
+  .center{padding:16px 14px 30px}
+  .top-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+  .top-actions>.primary-add{grid-column:span 2;width:100%;justify-content:center;padding-inline:8px}
+  .top-actions>.username-button{width:100%;max-width:none;min-width:0;padding:0 6px}
+  .top-actions>.iconbtn{width:100%;height:42px;flex-basis:auto}
+  .progressbox{gap:8px;padding:11px}
+  .progress-icon{width:32px;height:32px}
+  .progress-track{width:42px}
+  .progress-sub{font-size:10px}
+  .toolbar-actions{flex-wrap:wrap}
+  .toolbar-actions select,.search-input{flex:1 1 100%;width:100%;max-width:none}
+  .filters{gap:6px}
+  .filters>*{flex:1 1 calc(50% - 4px);min-width:0}
+  .filters select{max-width:none}
+  .calendar-header{display:grid;grid-template-columns:42px minmax(0,1fr) 42px auto;gap:6px}
+  .calendar-header>.iconbtn{width:42px;height:42px}
+  .calendar-today{min-height:42px;padding:6px}
+  .calendar-grid{grid-template-columns:repeat(7,minmax(0,1fr));overflow:hidden}
+  .cal-weekday{font-size:9px;padding:8px 0}
+  .cal-day{min-width:0;min-height:58px;max-height:100px;padding:4px 1px;gap:3px;font-size:10px}
+  .cal-task{font-size:7px;padding:2px 1px}
+  .cal-task .hover-date{display:none!important}
+  .cal-more{font-size:8px}
+  .day-agenda{margin-top:18px}
+  .modal-backdrop{padding:10px}
+  .modal{width:100%;max-height:calc(100dvh - 20px);padding:17px;border-radius:14px;overflow-y:auto}
+  .modal-actions{flex-wrap:wrap}
+  .modal-actions>.app-button{min-height:42px}
+  .auth-actions{grid-template-columns:repeat(2,minmax(0,1fr));padding-inline:0;gap:8px}
+  .detail-page{padding:16px}
+  .detail-page-header>div{justify-content:flex-end}
+  .detail-page h1{font-size:27px}
+  .detail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}

@@ -2,21 +2,50 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
+const DEVICE_ID_KEY = 'spectre.device-id';
+const DEVICE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const getPasswordResetToken = () => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('resetToken')) return params.get('resetToken');
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  return fragment.get('type') === 'recovery' ? fragment.get('access_token') || '' : '';
+};
+let deviceIdWasLogged = false;
+let guestAccountInitialization = null;
 const getDeviceId = () => {
-  let id = localStorage.getItem('spectre.device-id');
-  if (!id) { id = crypto.randomUUID(); localStorage.setItem('spectre.device-id', id); }
+  let id = localStorage.getItem(DEVICE_ID_KEY);
+  if (id && DEVICE_ID_PATTERN.test(id)) {
+    if (!deviceIdWasLogged) console.info('[Spectre] Retrieved the persistent device ID from local storage.');
+  } else {
+    id = crypto.randomUUID();
+    localStorage.setItem(DEVICE_ID_KEY, id);
+    console.info('[Spectre] Generated and persisted a new device ID.');
+  }
+  deviceIdWasLogged = true;
   return id;
 };
 const api = async (path, options = {}) => {
   const response = await fetch(`/api${path}`, {
     ...options,
     credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', 'x-device-id': getDeviceId(), ...options.headers },
+    headers: { 'Content-Type': 'application/json', ...options.headers },
     body: options.body && typeof options.body !== 'string' ? JSON.stringify(options.body) : options.body,
   });
   const payload = response.status === 204 ? null : await response.json().catch(() => null);
   if (!response.ok) throw new Error(payload?.message || `Request failed (${response.status})`);
   return payload;
+};
+const resolveGuestAccount = () => {
+  if (guestAccountInitialization) return guestAccountInitialization;
+  console.info('[Spectre] Checking the backend-managed persistent guest account cookie.');
+  guestAccountInitialization = api('/auth/guest', { method: 'POST', body: {}, headers: { 'x-device-id': getDeviceId() } }).then((account) => {
+    console.info(account.created ? '[Spectre] Backend created this guest account.' : '[Spectre] Reused the existing backend guest account.');
+    return account;
+  }).catch((error) => {
+    guestAccountInitialization = null;
+    throw error;
+  });
+  return guestAccountInitialization;
 };
 
 const isoDate = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -47,10 +76,15 @@ function App() {
   const [authUser, setAuthUser] = useState(null);
   const [authMode, setAuthMode] = useState('signup');
   const [authDraft, setAuthDraft] = useState({ email: '', password: '' });
+  const [passwordResetEmail, setPasswordResetEmail] = useState('');
+  const [passwordResetPassword, setPasswordResetPassword] = useState('');
+  const [passwordResetToken, setPasswordResetToken] = useState(getPasswordResetToken);
+  const [guestTransferSummary, setGuestTransferSummary] = useState(null);
   const [pendingReminder, setPendingReminder] = useState(() => { try { return JSON.parse(sessionStorage.getItem('spectre.pending-reminder') || 'null'); } catch { return null; } });
   const [recipientDraft, setRecipientDraft] = useState({ name: '', email: '' });
   const [scheduledActions, setScheduledActions] = useState([]);
   const [view, setView] = useState('today');
+  const [navOpen, setNavOpen] = useState(false);
   const [selectedFolder, setSelectedFolder] = useState('');
   const [selectedTag, setSelectedTag] = useState('');
   const [selectedDay, setSelectedDay] = useState(localToday());
@@ -87,8 +121,10 @@ function App() {
 
   const reload = useCallback(async () => {
     try {
-      const [nextTasks, nextFolders, nextTags, nextNotes, profile, user] = await Promise.all([
-        api('/tasks'), api('/folders'), api('/tags'), api('/notes'), api('/profile'), api('/auth/me'),
+      const user = await api('/auth/me');
+      if (!user) await resolveGuestAccount();
+      const [nextTasks, nextFolders, nextTags, nextNotes, profile] = await Promise.all([
+        api('/tasks'), api('/folders'), api('/tags'), api('/notes'), api('/profile'),
       ]);
       if (![nextTasks, nextFolders, nextTags, nextNotes].every(Array.isArray) || !profile?.username) throw new Error('The API returned an unexpected response. Restart the updated NestJS server and try again.');
       setTasks(nextTasks); setFolders(nextFolders); setTags(nextTags); setNotes(nextNotes);
@@ -100,7 +136,12 @@ function App() {
   useEffect(() => { reload(); }, [reload]);
   useEffect(() => { if (pendingReminder) sessionStorage.setItem('spectre.pending-reminder', JSON.stringify(pendingReminder)); else sessionStorage.removeItem('spectre.pending-reminder'); }, [pendingReminder]);
   useEffect(() => { if (!loading && pendingReminder && !modal) setModal(authUser ? (pendingReminder.recipientEmail ? 'reminder-confirm' : 'recipient') : 'auth'); }, [loading, pendingReminder, authUser, modal]);
+  useEffect(() => { if (passwordResetToken) setModal('password-reset'); }, [passwordResetToken]);
   useEffect(() => { document.documentElement.dataset.theme = dark ? 'dark' : 'light'; localStorage.setItem('spectre.theme', dark ? 'dark' : 'light'); }, [dark]);
+  useEffect(() => {
+    document.body.classList.toggle('nav-open', navOpen);
+    return () => document.body.classList.remove('nav-open');
+  }, [navOpen]);
   useEffect(() => {
     const check = async () => {
       if (dueAlert || modal) return;
@@ -153,7 +194,7 @@ function App() {
   const viewTitle = view === 'calendar' ? ['Your ', 'calendar.'] : view === 'upcoming' ? ['Looking ', 'ahead.'] : view === 'completed' ? ['Look what ', 'you did.'] : view === 'folder' ? [`${selectedFolder} `, 'folder.'] : view === 'tag' ? ['Tagged ', `#${selectedTag}.`] : view === 'all' ? ['All your ', 'tasks.'] : ['Today, ', 'well spent.'];
   const listTitle = view === 'today' ? 'Your tasks' : view === 'upcoming' ? 'Coming up' : view === 'completed' ? 'Completed' : view === 'folder' ? selectedFolder : view === 'tag' ? `#${selectedTag}` : 'All tasks';
 
-  function changeView(next) { setView(next); setSelectedFolder(''); setSelectedTag(''); }
+  function changeView(next) { setView(next); setSelectedFolder(''); setSelectedTag(''); setNavOpen(false); }
   function startCreateTask(defaults = {}) { setEditingId(null); setTaskDraft(emptyTask(defaults)); setSubtaskText(''); setAttachmentFiles([]); setModal('task'); }
   function editTask(task) { setEditingId(task.id); setTaskDraft({ ...task, tags: (task.tags || []).join(', '), due: task.due?.slice(0, 16) || '' }); setSubtaskText(''); setAttachmentFiles(task.attachments || []); setSelectedTask(null); setModal('task'); }
   async function saveTask(event) {
@@ -178,10 +219,44 @@ function App() {
     setBusyAction('auth');
     try {
       const user = await api(`/auth/${authMode === 'signup' ? 'signup' : 'login'}`, { method: 'POST', body: authDraft });
-      setAuthUser(user); setModal(null); setAuthDraft({ email: '', password: '' });
-      if (pendingReminder) setModal('recipient');
+      const hasGuestData = tasks.length > 0 || notes.length > 0 || tags.length > 0 || folders.some((folder) => !['Personal', 'Work'].includes(folder));
+      if (hasGuestData) setGuestTransferSummary({ tasks: tasks.length, notes: notes.length });
+      setAuthUser(user); setAuthDraft({ email: '', password: '' });
+      if (hasGuestData) setModal('guest-transfer');
+      else if (pendingReminder) setModal('recipient');
       else showFeedback('success', 'You are signed in.');
       await reload();
+    } catch (err) { showFeedback('error', err.message); }
+    finally { setBusyAction(''); }
+  }
+  async function finishGuestTransition(transfer) {
+    setBusyAction(transfer ? 'guest-transfer' : 'finish-signin');
+    try {
+      const result = transfer ? await api('/auth/transfer-guest', { method: 'POST', body: { confirm: true } }) : null;
+      await reload();
+      setGuestTransferSummary(null);
+      setModal(null);
+      if (pendingReminder) setModal('recipient');
+      else if (transfer) showFeedback('success', `Transferred ${result.tasksTransferred} task${result.tasksTransferred === 1 ? '' : 's'} and ${result.notesTransferred} note${result.notesTransferred === 1 ? '' : 's'}. Existing account items were preserved.`);
+      else showFeedback('success', 'You are signed in. Your guest data remains on this device.');
+    } catch (err) { showFeedback('error', err.message); }
+    finally { setBusyAction(''); }
+  }
+  async function requestPasswordReset(event) {
+    event.preventDefault(); setBusyAction('password-reset-request');
+    try {
+      const result = await api('/auth/password-reset', { method: 'POST', body: { email: passwordResetEmail } });
+      setModal(null); showFeedback('success', result.message || 'If an account exists for that email, a password reset link has been sent.', 'Check your email');
+    } catch (err) { showFeedback('error', err.message); }
+    finally { setBusyAction(''); }
+  }
+  async function completePasswordReset(event) {
+    event.preventDefault(); setBusyAction('password-reset-complete');
+    try {
+      const result = await api('/auth/password-reset/confirm', { method: 'POST', body: { token: passwordResetToken, password: passwordResetPassword } });
+      setPasswordResetToken(''); setPasswordResetPassword('');
+      window.history.replaceState({}, '', window.location.pathname);
+      setAuthMode('login'); showFeedback('success', result.message, 'Password updated');
     } catch (err) { showFeedback('error', err.message); }
     finally { setBusyAction(''); }
   }
@@ -270,8 +345,8 @@ function App() {
     ids.splice(to, 0, ids.splice(from, 1)[0]); setTasks((current) => current.map((task) => ({ ...task, order: ids.indexOf(task.id) })));
     api('/tasks/reorder', { method: 'PUT', body: { ids } }).catch((err) => { showFeedback('error', err.message); reload(); });
   }
-  function openFolderForm() { setNameDraft(''); setModal('folder'); }
-  function openTagForm() { setNameDraft(''); setModal('tag'); }
+  function openFolderForm() { setNameDraft(''); setNavOpen(false); setModal('folder'); }
+  function openTagForm() { setNameDraft(''); setNavOpen(false); setModal('tag'); }
 
   const navItems = [
     ['today', '◷', 'Today', todayCount || ''], ['upcoming', '▦', 'Upcoming', ''],
@@ -282,16 +357,17 @@ function App() {
   if (loading) return <LoadingSplash />;
 
   return <div className="app-shell">
+    {navOpen && <AppButton className="sidebar-scrim" aria-label="Close navigation" onClick={() => setNavOpen(false)} />}
     <aside className="sidebar">
       <div className="brand"><span className="brand-icon">✓</span>Spectre</div>
       <section className="nav-group"><div className="navgroup-title">Workspace</div>{navItems.map(([key, icon, label, count]) => <AppButton key={key} className={`navitem ${view === key ? 'active' : ''}`} onClick={() => changeView(key)}><span className="navicon">{icon}</span>{label}<span className="count">{count}</span></AppButton>)}</section>
-      <section className="nav-group"><div className="navgroup-title">Folders <AppButton className="mini" title="Create folder" onClick={openFolderForm}>＋</AppButton></div>{folders.length ? folders.map((folder) => <div className="folder-row" key={folder}><AppButton className={`navitem ${view === 'folder' && selectedFolder === folder ? 'active' : ''}`} onClick={() => { setSelectedFolder(folder); setSelectedTag(''); setView('folder'); }}><span className="navicon">▱</span>{folder}<span className="count">{tasks.filter((task) => task.folder === folder && task.status !== 'Completed').length}</span></AppButton><AppButton className="mini folder-delete" title={`Delete ${folder}`} loading={busyAction === `delete-folder-${folder}`} onClick={() => removeFolder(folder)}>×</AppButton></div>) : <AppButton className="folder-empty-action" onClick={openFolderForm}>＋ Create folder</AppButton>}</section>
-      {tags.length > 0 && <section className="nav-group"><div className="navgroup-title">Tags</div>{tags.map((tag, index) => <AppButton className="tagline" key={tag} onClick={() => { setSelectedTag(tag); setSelectedFolder(''); setView('tag'); }}><span className={`dot dot-${index % 5}`} />{tag}</AppButton>)}</section>}
+      <section className="nav-group"><div className="navgroup-title">Folders <AppButton className="mini" title="Create folder" onClick={openFolderForm}>＋</AppButton></div>{folders.length ? folders.map((folder) => <div className="folder-row" key={folder}><AppButton className={`navitem ${view === 'folder' && selectedFolder === folder ? 'active' : ''}`} onClick={() => { setSelectedFolder(folder); setSelectedTag(''); setView('folder'); setNavOpen(false); }}><span className="navicon">▱</span>{folder}<span className="count">{tasks.filter((task) => task.folder === folder && task.status !== 'Completed').length}</span></AppButton><AppButton className="mini folder-delete" title={`Delete ${folder}`} loading={busyAction === `delete-folder-${folder}`} onClick={() => removeFolder(folder)}>×</AppButton></div>) : <AppButton className="folder-empty-action" onClick={openFolderForm}>＋ Create folder</AppButton>}</section>
+      {tags.length > 0 && <section className="nav-group"><div className="navgroup-title">Tags</div>{tags.map((tag, index) => <AppButton className="tagline" key={tag} onClick={() => { setSelectedTag(tag); setSelectedFolder(''); setView('tag'); setNavOpen(false); }}><span className={`dot dot-${index % 5}`} />{tag}</AppButton>)}</section>}
       <AppButton className="sidebar-tip" onClick={() => setModal('notes')}>Notes and small thoughts live here. <strong>Write a note →</strong></AppButton>
     </aside>
 
     <main className="center">
-      <header className="topline"><div className="top-heading"><div className="date-kicker">{fmtDate(new Date(), { weekday: 'long', month: 'long', day: 'numeric' })}</div><h1>{viewTitle[0]}<span>{viewTitle[1]}</span></h1></div><div className="top-actions"><AppButton className="primary-add" onClick={() => startCreateTask()}>＋ New task</AppButton><AppButton className="username-button" title="Change username" onClick={() => { setUsernameDraft(username); setModal('username'); }}>{username}</AppButton><AppButton className="username-button" title={authUser ? 'Sign out' : 'Sign up or log in'} onClick={() => authUser ? setModal('signout-confirm') : (setAuthMode('signup'), setModal('auth'))}>{authUser ? 'Sign out' : 'Account'}</AppButton><AppButton className="iconbtn" title="Scheduled actions" loading={busyAction === 'load-scheduled'} onClick={showScheduledActions}>♧</AppButton><AppButton className="iconbtn" title="Toggle theme" onClick={() => setDark((value) => !value)}>◐</AppButton><AppButton className="iconbtn mobile-menu" title="Open navigation" onClick={() => document.body.classList.toggle('nav-open')}>☰</AppButton><AppButton className="iconbtn" title="Notes" onClick={() => setModal('notes')}>▤</AppButton></div></header>
+      <header className="topline"><div className="top-heading"><div className="date-kicker">{fmtDate(new Date(), { weekday: 'long', month: 'long', day: 'numeric' })}</div><h1>{viewTitle[0]}<span>{viewTitle[1]}</span></h1></div><div className="top-actions"><AppButton className="primary-add" onClick={() => startCreateTask()}>＋ New task</AppButton><AppButton className="username-button" title="Change username" onClick={() => { setUsernameDraft(username); setModal('username'); }}>{username}</AppButton><AppButton className="username-button" title={authUser ? 'Sign out' : 'Sign up or log in'} onClick={() => authUser ? setModal('signout-confirm') : (setAuthMode('signup'), setModal('auth'))}>{authUser ? 'Sign out' : 'Account'}</AppButton><AppButton className="iconbtn" title="Scheduled actions" loading={busyAction === 'load-scheduled'} onClick={showScheduledActions}>♧</AppButton><AppButton className="iconbtn" title="Toggle theme" onClick={() => setDark((value) => !value)}>◐</AppButton><AppButton className="iconbtn mobile-menu" title="Open navigation" aria-expanded={navOpen} onClick={() => setNavOpen((value) => !value)}>☰</AppButton><AppButton className="iconbtn" title="Notes" onClick={() => setModal('notes')}>▤</AppButton></div></header>
       <section className="progressbox"><div className="progress-icon">✳</div><div className="progress-copy"><div className="progress-title">{percentDone === 100 ? 'Beautifully done' : tasks.length - totalDone ? `${tasks.length - totalDone} ${tasks.length - totalDone === 1 ? 'task' : 'tasks'} in your hands` : 'A fresh start'}</div><div className="progress-sub">{totalDone ? `${totalDone} ${totalDone === 1 ? 'task' : 'tasks'} completed — keep going.` : 'Small steps make a meaningful day.'}</div></div><div className="progress-track"><div className="progress-fill" style={{ width: `${percentDone}%` }} /></div><div className="progress-num">{percentDone}%</div></section>
       {view !== 'calendar' ? <>
         <div className="toolbar"><h2>{listTitle}</h2><div className="toolbar-actions"><TextInput className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by title" aria-label="Search tasks by title" /><select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort tasks"><option value="manual">Manual order</option><option value="due">Due date</option><option value="priority">Priority</option><option value="created">Creation date</option><option value="alpha">Alphabetical</option></select></div></div>
@@ -307,7 +383,10 @@ function App() {
       <div className="form-grid"><label className="field">Start date *<TextInput type="date" required value={taskDraft.start} onChange={(event) => setTaskDraft({ ...taskDraft, start: event.target.value })} /></label><label className="field">Due date & time *<TextInput type="datetime-local" required value={taskDraft.due} onChange={(event) => setTaskDraft({ ...taskDraft, due: event.target.value })} /></label><label className="field">Status *<select value={taskDraft.status} onChange={(event) => setTaskDraft({ ...taskDraft, status: event.target.value })}>{['To Do', 'In Progress', 'Completed'].map((item) => <option key={item}>{item}</option>)}</select></label><label className="field">Priority *<select value={taskDraft.priority} onChange={(event) => setTaskDraft({ ...taskDraft, priority: event.target.value })}>{['High', 'Medium', 'Low'].map((item) => <option key={item}>{item}</option>)}</select></label></div>
       <details className="optional-details" open={Boolean(editingId && (taskDraft.description || taskDraft.folder || taskDraft.tags || taskDraft.notes))}><summary>＋ Optional details</summary><div className="form-grid"><label className="field full">Description<textarea rows="3" value={taskDraft.description || ''} onChange={(event) => setTaskDraft({ ...taskDraft, description: event.target.value })} /></label><label className="field">Folder<select value={taskDraft.folder || ''} onChange={(event) => setTaskDraft({ ...taskDraft, folder: event.target.value })}><option value="">No folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select></label><label className="field">Tags, separated by commas<TextInput value={taskDraft.tags} onChange={(event) => setTaskDraft({ ...taskDraft, tags: event.target.value })} /></label><label className="field">Repeat<select value={taskDraft.recurrence || ''} onChange={(event) => setTaskDraft({ ...taskDraft, recurrence: event.target.value })}><option value="">Does not repeat</option>{['Daily', 'Weekly', 'Monthly'].map((item) => <option key={item}>{item}</option>)}</select></label><label className="field">In-app reminder<select value={taskDraft.reminder || ''} onChange={(event) => setTaskDraft({ ...taskDraft, reminder: event.target.value })}><option value="">No reminder</option><option value="at-due">At due time</option><option value="10">10 minutes before</option><option value="60">1 hour before</option><option value="1440">1 day before</option></select></label><label className="field full reminder-check"><TextInput type="checkbox" checked={Boolean(taskDraft.emailReminder)} onChange={(event) => setTaskDraft({ ...taskDraft, emailReminder: event.target.checked })} /> Send an email reminder to someone at the due time (requires sign in)</label><label className="field full">Checklist<div className="inline-add"><TextInput value={subtaskText} onChange={(event) => setSubtaskText(event.target.value)} placeholder="Add checklist item" /><AppButton type="button" className="iconbtn" onClick={() => { if (subtaskText.trim()) { setTaskDraft({ ...taskDraft, subtasks: [...(taskDraft.subtasks || []), { text: subtaskText.trim(), done: false }] }); setSubtaskText(''); } }}>＋</AppButton></div><div className="chip-list">{(taskDraft.subtasks || []).map((item, index) => <AppButton type="button" className="chip" key={`${item.text}-${index}`} onClick={() => setTaskDraft({ ...taskDraft, subtasks: taskDraft.subtasks.filter((_, i) => i !== index) })}>{item.text} ×</AppButton>)}</div></label><label className="field full">Attachments<TextInput type="file" multiple onChange={(event) => setAttachmentFiles([...attachmentFiles, ...[...event.target.files].map((file) => ({ name: file.name, size: file.size, type: file.type }))])} /><div className="chip-list">{attachmentFiles.map((file, index) => <AppButton type="button" className="chip" key={`${file.name}-${index}`} onClick={() => setAttachmentFiles(attachmentFiles.filter((_, i) => i !== index))}>{file.name} ×</AppButton>)}</div></label><label className="field full">Task notes<textarea rows="3" value={taskDraft.notes || ''} onChange={(event) => setTaskDraft({ ...taskDraft, notes: event.target.value })} /></label></div></details>
       <div className="modal-actions">{editingId && <AppButton type="button" className="delete-task" onClick={() => { const task = tasks.find((item) => item.id === editingId); if (task) deleteTask(task); setModal(null); }}>Delete task</AppButton>}<AppButton className="save-task" loading={busyAction === 'save-task'}>{busyAction === 'save-task' ? 'Saving…' : 'Save task'}</AppButton></div></form></Modal>}
-    {modal === 'auth' && <Modal title={authMode === 'signup' ? 'Create your account' : 'Log in'} onClose={() => { if (pendingReminder) setPendingReminder(null); setModal(null); }}><p className="auth-copy">{pendingReminder ? 'Sign in to continue with your email reminder. Your task is saved.' : 'Use your email and password to access scheduled actions.'}</p><form className="task-form" onSubmit={authenticate}><label className="field">Email<TextInput required type="email" autoComplete="email" value={authDraft.email} onChange={(event) => setAuthDraft({ ...authDraft, email: event.target.value })} /></label><label className="field">Password<TextInput required type="password" minLength={authMode === 'signup' ? 8 : undefined} autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} value={authDraft.password} onChange={(event) => setAuthDraft({ ...authDraft, password: event.target.value })} /></label><div className="modal-actions auth-actions"><AppButton className="save-task" loading={busyAction === 'auth'}>{busyAction === 'auth' ? 'Please wait…' : authMode === 'signup' ? 'Sign up' : 'Log in'}</AppButton><AppButton type="button" className="secondary-button" onClick={() => setAuthMode(authMode === 'signup' ? 'login' : 'signup')}>{authMode === 'signup' ? 'I have an account' : 'Create account'}</AppButton></div></form></Modal>}
+    {modal === 'auth' && <Modal title={authMode === 'signup' ? 'Create your account' : 'Log in'} onClose={() => { if (pendingReminder) setPendingReminder(null); setModal(null); }}><p className="auth-copy">{pendingReminder ? 'Sign in to continue with your email reminder. Your task is saved.' : 'Use your email and password to access scheduled actions.'}</p><form className="task-form" onSubmit={authenticate}><label className="field">Email<TextInput required type="email" autoComplete="email" value={authDraft.email} onChange={(event) => setAuthDraft({ ...authDraft, email: event.target.value })} /></label><label className="field">Password<TextInput required type="password" minLength={authMode === 'signup' ? 8 : undefined} autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} value={authDraft.password} onChange={(event) => setAuthDraft({ ...authDraft, password: event.target.value })} /></label><div className="modal-actions auth-actions"><AppButton className="save-task" loading={busyAction === 'auth'}>{busyAction === 'auth' ? 'Please wait…' : authMode === 'signup' ? 'Sign up' : 'Log in'}</AppButton><AppButton type="button" className="secondary-button" onClick={() => setAuthMode(authMode === 'signup' ? 'login' : 'signup')}>{authMode === 'signup' ? 'I have an account' : 'Create account'}</AppButton></div></form>{authMode === 'login' && <AppButton className="text-link" onClick={() => { setPasswordResetEmail(authDraft.email); setModal('forgot-password'); }}>Forgot password?</AppButton>}</Modal>}
+    {modal === 'forgot-password' && <Modal title="Reset your password" onClose={() => setModal('auth')}><p className="auth-copy">Enter your account email. If it matches an account, we’ll send a reset link.</p><form className="task-form" onSubmit={requestPasswordReset}><label className="field">Email<TextInput required type="email" autoComplete="email" value={passwordResetEmail} onChange={(event) => setPasswordResetEmail(event.target.value)} /></label><div className="modal-actions auth-actions"><AppButton type="button" className="secondary-button" onClick={() => setModal('auth')}>Back to log in</AppButton><AppButton className="save-task" loading={busyAction === 'password-reset-request'}>{busyAction === 'password-reset-request' ? 'Sending…' : 'Send reset link'}</AppButton></div></form></Modal>}
+    {modal === 'password-reset' && <Modal title="Choose a new password" onClose={() => { setPasswordResetToken(''); window.history.replaceState({}, '', window.location.pathname); setModal('auth'); }}><p className="auth-copy">This reset link expires after one hour and can only be used once.</p><form className="task-form" onSubmit={completePasswordReset}><label className="field">New password<TextInput required type="password" minLength="8" autoComplete="new-password" value={passwordResetPassword} onChange={(event) => setPasswordResetPassword(event.target.value)} /></label><div className="modal-actions auth-actions"><AppButton className="save-task" loading={busyAction === 'password-reset-complete'}>{busyAction === 'password-reset-complete' ? 'Updating…' : 'Update password'}</AppButton></div></form></Modal>}
+    {modal === 'guest-transfer' && <Modal title="Transfer your guest tasks?" onClose={() => finishGuestTransition(false)}><p className="auth-copy">This device has {guestTransferSummary?.tasks || 0} task{guestTransferSummary?.tasks === 1 ? '' : 's'} and {guestTransferSummary?.notes || 0} note{guestTransferSummary?.notes === 1 ? '' : 's'} saved as a guest. You can merge them into this account. Existing account data stays intact and matching tasks are skipped.</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" loading={busyAction === 'finish-signin'} onClick={() => finishGuestTransition(false)}>Keep separate</AppButton><AppButton className="save-task" loading={busyAction === 'guest-transfer'} onClick={() => finishGuestTransition(true)}>Transfer guest data</AppButton></div></Modal>}
     {modal === 'recipient' && pendingReminder && <Modal title="Who should receive this reminder?" onClose={() => setModal(null)}><p className="auth-copy">Your task is saved. Add the recipient details before scheduling the email.</p><form className="task-form" onSubmit={continueToConfirmation}><label className="field">Name<TextInput required maxLength="200" value={recipientDraft.name} onChange={(event) => setRecipientDraft({ ...recipientDraft, name: event.target.value })} placeholder="Michael" /></label><label className="field">Email<TextInput required type="email" value={recipientDraft.email} onChange={(event) => setRecipientDraft({ ...recipientDraft, email: event.target.value })} placeholder="michael@example.com" /></label><div className="modal-actions"><AppButton type="button" className="secondary-button" onClick={() => { setModal(null); setPendingReminder(null); }}>Cancel reminder</AppButton><AppButton className="save-task">Continue</AppButton></div></form></Modal>}
     {modal === 'reminder-confirm' && pendingReminder && <Modal title="Confirm email reminder" onClose={() => setModal('recipient')}><div className="reminder-summary"><strong>{pendingReminder.recipientName}</strong><span>{pendingReminder.recipientEmail}</span><p>{pendingReminder.message}</p><span>{fmtDate(pendingReminder.scheduledAt, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · {Intl.DateTimeFormat().resolvedOptions().timeZone}</span></div><div className="modal-actions"><AppButton className="secondary-button" onClick={() => setModal('recipient')}>Edit recipient</AppButton><AppButton className="save-task" loading={busyAction === 'schedule-reminder'} onClick={scheduleReminder}>{busyAction === 'schedule-reminder' ? 'Scheduling…' : 'Schedule reminder'}</AppButton></div></Modal>}
     {modal === 'scheduled-actions' && <Modal title="Scheduled actions" onClose={() => setModal(null)}>{scheduledActions.length ? <div className="scheduled-list">{scheduledActions.map((action) => <article className="note-card" key={action.id}><div className="note-top"><strong>{action.subject}</strong><span className="pill status">{action.status}</span></div><p>{action.recipientName} · {action.recipientEmail}</p><div className="note-date">{fmtDate(action.scheduledAt, { month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })} · {action.timezone}</div>{action.failureReason && <p className="failure-reason">{action.failureReason}</p>}</article>)}</div> : <div className="empty"><strong>No scheduled reminders</strong><span>Create an email reminder from a task's optional details.</span></div>}</Modal>}

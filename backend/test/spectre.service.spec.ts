@@ -1,65 +1,69 @@
 import { BadRequestException } from '@nestjs/common';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { JsonStore, ScopeContext } from '../src/store';
+import { randomUUID } from 'node:crypto';
 import { SpectreService } from '../src/spectre.service';
+import { ScopeContext, SpectreData } from '../src/store';
 
 describe('SpectreService (unit)', () => {
-  let directory: string;
   let service: SpectreService;
+  let scopes: ScopeContext;
+  let rows: Map<string, SpectreData>;
+  let store: any;
 
   beforeEach(() => {
-    directory = mkdtempSync(join(tmpdir(), 'spectre-unit-'));
-    service = new SpectreService(new JsonStore(new ScopeContext(), join(directory, 'data.json')));
-  });
-  afterEach(() => rmSync(directory, { recursive: true, force: true }));
-
-  const validTask = (extra = {}) => ({
-    title: 'Write API tests', start: '2026-09-28', due: '2026-09-29T10:00',
-    status: 'To Do', priority: 'High', tags: ['Engineering'], subtasks: [], attachments: [], ...extra,
-  });
-
-  it('creates tasks, normalizes tags, and filters by tag and title', () => {
-    const task = service.createTask(validTask({ tags: ['Engineering', 'Engineering', ''] }));
-    expect(task.id).toBeTruthy();
-    expect(task.tags).toEqual(['Engineering']);
-    expect(service.listTasks({ tag: 'Engineering', title: 'API' })).toHaveLength(1);
-    expect(service.listTasks({ title: 'missing' })).toHaveLength(0);
+    scopes = new ScopeContext(); rows = new Map();
+    store = {
+      id: () => randomUUID(),
+      read: async (scope = scopes.current()) => structuredClone(rows.get(scope) || { tasks: [], folders: ['Personal', 'Work'], tags: [], notes: [], username: 'User1234' }),
+      write: async (data: SpectreData, scope = scopes.current()) => { rows.set(scope, structuredClone(data)); },
+    };
+    service = new SpectreService(store);
   });
 
-  it('rejects invalid task status and missing required fields', () => {
-    expect(() => service.createTask(validTask({ status: 'Blocked' }))).toThrow(BadRequestException);
-    expect(() => service.createTask(validTask({ title: ' ' }))).toThrow(BadRequestException);
+  const validTask = (extra = {}) => ({ title: 'Write API tests', start: '2026-09-28', due: '2026-09-29T10:00', status: 'To Do', priority: 'High', tags: ['Engineering'], subtasks: [], attachments: [], ...extra });
+
+  it('creates tasks, normalizes tags, and filters by tag and title', async () => {
+    const task = await service.createTask(validTask({ tags: ['Engineering', 'Engineering', ''] }));
+    expect(task.id).toBeTruthy(); expect(task.tags).toEqual(['Engineering']);
+    expect(await service.listTasks({ tag: 'Engineering', title: 'API' })).toHaveLength(1);
+    expect(await service.listTasks({ title: 'missing' })).toHaveLength(0);
   });
 
-  it('creates the next recurring occurrence only on the first completion', () => {
-    const task = service.createTask(validTask({ recurrence: 'Weekly', due: '2026-09-29T10:00' }));
-    const first = service.updateTask(task.id, { status: 'Completed' });
-    expect(first.recurringTask?.due).toBe('2026-10-06T10:00');
-    expect(first.recurringTask?.status).toBe('To Do');
-    const second = service.updateTask(task.id, { status: 'Completed' });
-    expect(second.recurringTask).toBeUndefined();
-    expect(service.listTasks()).toHaveLength(2);
+  it('initializes persistent owner state and keeps each scope separate', async () => {
+    const guest = `guest:${randomUUID()}`;
+    const first = await scopes.run(guest, () => service.getProfile());
+    await scopes.run(guest, () => service.updateProfile({ username: 'Ada' }));
+    expect(await scopes.run(guest, () => service.getProfile())).toEqual({ username: 'Ada' });
+    expect(await service.getProfile()).toEqual(first);
   });
 
-  it('reorders tasks and rejects duplicate ids', () => {
-    const first = service.createTask(validTask({ title: 'First' }));
-    const second = service.createTask(validTask({ title: 'Second' }));
-    expect(service.reorderTasks([second.id, first.id]).map((task) => task.title)).toEqual(['Second', 'First']);
-    expect(() => service.reorderTasks([first.id, first.id])).toThrow(BadRequestException);
+  it('rejects invalid task status and missing required fields', async () => {
+    await expect(service.createTask(validTask({ status: 'Blocked' }))).rejects.toThrow(BadRequestException);
+    await expect(service.createTask(validTask({ title: ' ' }))).rejects.toThrow(BadRequestException);
   });
 
-  it('manages folders, tags, notes, and username', () => {
-    expect(service.listFolders()).toContain('Personal');
-    service.createFolder('Home');
-    expect(() => service.createFolder('Home')).toThrow(BadRequestException);
-    service.createTag('Focus');
-    expect(service.listTags()).toContain('Focus');
-    const note = service.createNote({ title: 'Idea', text: 'Ship Spectre' });
-    expect(service.updateNote(note.id, { text: 'Ship React Spectre' }).text).toBe('Ship React Spectre');
-    expect(service.deleteNote(note.id).id).toBe(note.id);
-    expect(service.updateProfile({ username: 'Ada' })).toEqual({ username: 'Ada' });
-    expect(service.getProfile()).toEqual({ username: 'Ada' });
+  it('creates the next recurring occurrence only on the first completion', async () => {
+    const task = await service.createTask(validTask({ recurrence: 'Weekly', due: '2026-09-29T10:00' }));
+    const first = await service.updateTask(task.id, { status: 'Completed' });
+    expect(first.recurringTask?.due).toBe('2026-10-06T10:00'); expect(first.recurringTask?.status).toBe('To Do');
+    const second = await service.updateTask(task.id, { status: 'Completed' });
+    expect(second.recurringTask).toBeUndefined(); expect(await service.listTasks()).toHaveLength(2);
+  });
+
+  it('reorders tasks and rejects duplicate ids', async () => {
+    const first = await service.createTask(validTask({ title: 'First' }));
+    const second = await service.createTask(validTask({ title: 'Second' }));
+    expect((await service.reorderTasks([second.id, first.id])).map((task) => task.title)).toEqual(['Second', 'First']);
+    await expect(service.reorderTasks([first.id, first.id])).rejects.toThrow(BadRequestException);
+  });
+
+  it('manages folders, tags, notes, and username', async () => {
+    expect(await service.listFolders()).toContain('Personal');
+    await service.createFolder('Home'); await expect(service.createFolder('Home')).rejects.toThrow(BadRequestException);
+    await service.createTag('Focus'); expect(await service.listTags()).toContain('Focus');
+    const note = await service.createNote({ title: 'Idea', text: 'Ship Spectre' });
+    expect((await service.updateNote(note.id, { text: 'Ship React Spectre' })).text).toBe('Ship React Spectre');
+    expect((await service.deleteNote(note.id)).id).toBe(note.id);
+    expect(await service.updateProfile({ username: 'Ada' })).toEqual({ username: 'Ada' });
+    expect(await service.getProfile()).toEqual({ username: 'Ada' });
   });
 });
