@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { AuthService } from '../src/auth.service';
 import { ReminderService } from '../src/reminder.service';
 import { SpectreData } from '../src/store';
+import { createHash } from 'node:crypto';
 
 describe('AuthService (Supabase integration boundary)', () => {
   let auth: AuthService;
@@ -67,7 +68,7 @@ describe('AuthService (Supabase integration boundary)', () => {
     jest.spyOn(auth, 'getGuestAccount').mockResolvedValue({ id: 'guest-1', device_id: 'device-1', created_at: '' });
     await expect(auth.transferGuestData('user-1', 'guest-1', false)).rejects.toThrow(BadRequestException);
     const result = await auth.transferGuestData('user-1', 'guest-1', true);
-    expect(result).toEqual({ tasksTransferred: 1, notesTransferred: 0, foldersMerged: 1, tagsMerged: 1 });
+    expect(result).toEqual({ tasksTransferred: 1, notesTransferred: 0, foldersMerged: 1, tagsMerged: 1, taskIdMap: { 'guest-1': 'guest-1', 'guest-2': 'account-copy' } });
     expect(rows.get('user:user-1')?.tasks).toHaveLength(2);
     expect(rows.get('user:user-1')?.tasks[0]).toEqual(expect.objectContaining({ id: 'account-copy', status: 'In Progress' }));
     expect(rows.get('guest:device-1')?.tasks).toHaveLength(2);
@@ -83,13 +84,66 @@ describe('AuthService (Supabase integration boundary)', () => {
   it('claims and completes scheduled email reminders through the atomic database RPC', async () => {
     const sent: string[] = [];
     const workerAuth = {
-      claimDueActions: jest.fn().mockResolvedValue([{ id: 'action-1', recipientName: 'Jamie', recipientEmail: 'jamie@example.com', subject: 'Reminder', message: 'Finish it' }]),
+      claimDueActions: jest.fn().mockResolvedValue([{ id: 'action-1', recipientName: 'Jamie', recipientEmail: 'jamie@example.com', subject: 'Reminder', message: 'Finish it', scheduledAt: Date.now() }]),
+      createGuestReminderLink: jest.fn(async () => 'https://spectre.example/#reminder=token'),
       sendEmail: jest.fn(async (to: string) => { sent.push(to); }),
       finishAction: jest.fn(async () => undefined),
     } as any;
     const worker = new ReminderService(workerAuth);
     await worker.runDue();
     expect(sent).toEqual(['jamie@example.com']);
+    expect(workerAuth.createGuestReminderLink).toHaveBeenCalledWith('action-1', expect.any(Number));
     expect(workerAuth.finishAction).toHaveBeenCalledWith('action-1');
+  });
+
+  it('stores only a hash of the guest link token and returns a link for the configured app URL', async () => {
+    const inserted: any[] = [];
+    supabase.db.from = jest.fn(() => ({ insert: jest.fn(async (row: any) => { inserted.push(row); return { error: null }; }) }));
+    const prior = process.env.APP_URL; process.env.APP_URL = 'https://spectre.example/';
+    try {
+      const url = await auth.createGuestReminderLink('action-1', Date.now() + 60_000);
+      const token = new URL(url).hash.match(/reminder=([A-Za-z0-9_-]+)/)?.[1];
+      expect(url.startsWith('https://spectre.example/#reminder=')).toBe(true);
+      expect(token).toBeTruthy();
+      expect(inserted[0]).toEqual(expect.objectContaining({ scheduled_action_id: 'action-1', token_hash: createHash('sha256').update(token!).digest('hex') }));
+      expect(inserted[0].token_hash).not.toBe(token);
+    } finally { if (prior === undefined) delete process.env.APP_URL; else process.env.APP_URL = prior; }
+  });
+
+  it('acknowledges a guest reminder through the atomic RPC using only a token hash', async () => {
+    const token = 'A'.repeat(43);
+    const rpc = jest.fn(async () => ({ data: { acknowledgedAt: '2026-11-02T12:00:00.000Z' }, error: null }));
+    supabase.db.rpc = rpc;
+    await expect(auth.acknowledgeGuestReminder(token, '127.0.0.1')).resolves.toEqual({ acknowledgedAt: '2026-11-02T12:00:00.000Z' });
+    expect(rpc).toHaveBeenCalledWith('acknowledge_guest_reminder', { p_token_hash: createHash('sha256').update(token).digest('hex') });
+  });
+
+  it('records a failed delivery for database-managed retry instead of reporting success', async () => {
+    const workerAuth = {
+      claimDueActions: jest.fn().mockResolvedValue([{ id: 'action-2', recipientName: 'Jamie', recipientEmail: 'jamie@example.com', subject: 'Reminder', message: 'Finish it', scheduledAt: Date.now() }]),
+      createGuestReminderLink: jest.fn(async () => 'https://spectre.example/#reminder=token'),
+      sendEmail: jest.fn(async () => { throw new Error('provider unavailable'); }),
+      finishAction: jest.fn(async () => undefined),
+    } as any;
+    await new ReminderService(workerAuth).runDue();
+    expect(workerAuth.finishAction).toHaveBeenCalledWith('action-2', 'provider unavailable');
+  });
+
+  it('sends reminder messages through Resend with the configured sender and API key', async () => {
+    const originalKey = process.env.RESEND_API_KEY; const originalFrom = process.env.EMAIL_FROM;
+    process.env.RESEND_API_KEY = 're_test_key'; process.env.EMAIL_FROM = 'Spectre <reminders@example.com>';
+    const fetchMock = jest.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true, status: 200 } as Response);
+    try {
+      await auth.sendEmail('michael@example.com', 'Reminder', 'Please do this', '<p>Please do this</p>');
+      expect(fetchMock).toHaveBeenCalledWith('https://api.resend.com/emails', expect.objectContaining({
+        method: 'POST',
+        headers: { Authorization: 'Bearer re_test_key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: 'Spectre <reminders@example.com>', to: ['michael@example.com'], subject: 'Reminder', text: 'Please do this', html: '<p>Please do this</p>' }),
+      }));
+    } finally {
+      fetchMock.mockRestore();
+      if (originalKey === undefined) delete process.env.RESEND_API_KEY; else process.env.RESEND_API_KEY = originalKey;
+      if (originalFrom === undefined) delete process.env.EMAIL_FROM; else process.env.EMAIL_FROM = originalFrom;
+    }
   });
 });

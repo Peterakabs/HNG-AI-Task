@@ -5,11 +5,12 @@ import { ScopeContext, SupabaseStore } from './store';
 import { AuthService, IdentityMiddleware } from './auth.service';
 import { ReminderService } from './reminder.service';
 import { SupabaseService } from './supabase.service';
+import { VoiceAssistantService } from './voice-assistant.service';
 import { NestModule, MiddlewareConsumer, RequestMethod } from '@nestjs/common';
 
 @Module({
   controllers: [AppController],
-  providers: [ScopeContext, AuthService, IdentityMiddleware, ReminderService, SpectreService, SupabaseStore, SupabaseService],
+  providers: [ScopeContext, AuthService, IdentityMiddleware, ReminderService, SpectreService, SupabaseStore, SupabaseService, VoiceAssistantService],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) { consumer.apply(IdentityMiddleware).forRoutes({ path: 'api/{*splat}', method: RequestMethod.ALL }); }

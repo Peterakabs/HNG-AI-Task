@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { SupabaseStore, SpectreData } from './store';
 
 const priorities = ['High', 'Medium', 'Low'];
-const statuses = ['To Do', 'In Progress', 'Completed'];
+const statuses = ['To Do', 'Pending', 'Acknowledged', 'In Progress', 'Completed'];
 
 @Injectable()
 export class SpectreService {
@@ -28,6 +28,11 @@ export class SpectreService {
   async createTask(input: Record<string, any>) {
     this.validateTask(input, true);
     const data = await this.store.read();
+    const assistantDraftId = typeof input.assistantDraftId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.assistantDraftId) ? input.assistantDraftId : undefined;
+    if (assistantDraftId) {
+      const prior = data.tasks.find((task) => task.assistantDraftId === assistantDraftId);
+      if (prior) return prior;
+    }
     const task = {
       id: this.store.id(), title: input.title.trim(), description: input.description?.trim() || '',
       start: input.start, due: input.due, status: input.status, priority: input.priority,
@@ -35,7 +40,7 @@ export class SpectreService {
       folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: input.subtasks || [],
       attachments: input.attachments || [], notes: input.notes?.trim() || '',
       recurrence: input.recurrence || '', reminder: input.reminder || '', notified: false,
-      createdAt: Date.now(), order: data.tasks.length,
+      createdAt: Date.now(), order: data.tasks.length, ...(assistantDraftId ? { assistantDraftId } : {}),
     };
     data.tasks.push(task);
     this.recordTags(data, task.tags);
@@ -153,7 +158,8 @@ export class SpectreService {
   }
   private validateTask(task: Record<string, any>, required: boolean) {
     if (required && (typeof task.title !== 'string' || !task.title.trim())) throw new BadRequestException('Task title is required.');
-    if (!statuses.includes(task.status)) throw new BadRequestException('Status must be To Do, In Progress, or Completed.');
+    if (!statuses.includes(task.status)) throw new BadRequestException('Status must be To Do, Pending, Acknowledged, In Progress, or Completed.');
+    if (['Pending', 'Acknowledged'].includes(task.status) && !task.emailReminder) throw new BadRequestException('Pending and Acknowledged are only valid for tasks with an external email reminder.');
     if (!priorities.includes(task.priority)) throw new BadRequestException('Priority must be High, Medium, or Low.');
     if (typeof task.start !== 'string' || !task.start || Number.isNaN(Date.parse(task.start))) throw new BadRequestException('A valid start date is required.');
     if (typeof task.due !== 'string' || !task.due || Number.isNaN(Date.parse(task.due))) throw new BadRequestException('A valid due date and time is required.');

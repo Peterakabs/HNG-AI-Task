@@ -10,6 +10,10 @@ const getPasswordResetToken = () => {
   const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
   return fragment.get('type') === 'recovery' ? fragment.get('access_token') || '' : '';
 };
+const getGuestReminderToken = () => {
+  const match = window.location.hash.match(/^#reminder=([A-Za-z0-9_-]{40,64})$/);
+  return match?.[1] || '';
+};
 let deviceIdWasLogged = false;
 let guestAccountInitialization = null;
 const getDeviceId = () => {
@@ -52,13 +56,25 @@ const isoDate = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).p
 const localToday = () => isoDate(new Date());
 const uid = () => Math.random().toString(36).slice(2, 10);
 const fmtDate = (value, options = { month: 'short', day: 'numeric' }) => value ? new Intl.DateTimeFormat(undefined, options).format(new Date(value)) : '';
+const deliveryStatusLabel = (status) => ({ scheduled: 'Scheduled', processing: 'Processing', sending: 'Processing', sent: 'Accepted by provider', completed: 'Accepted by provider', failed: 'Failed', cancelled: 'Cancelled' }[status] || status);
 const parseReminderRequest = (value) => {
-  const match = value.match(/^\s*remind\s+(.+?)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s+(today|tomorrow)\s+to\s+(.+?)\.?\s*$/i);
+  const time = '(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)';
+  const patterns = [
+    new RegExp(`^\\s*remind\\s+(.+?)\\s+${time}\\s+(today|tomorrow)\\s+to\\s+(.+?)\\.?\\s*$`, 'i'),
+    new RegExp(`^\\s*remind\\s+(.+?)\\s+(today|tomorrow)\\s+at\\s+${time}\\s+to\\s+(.+?)\\.?\\s*$`, 'i'),
+  ];
+  const [match, dateFirst] = patterns.map((pattern, index) => [value.match(pattern), index === 1]).find(([candidate]) => candidate) || [];
   if (!match) return null;
-  const date = new Date(); if (match[5].toLowerCase() === 'tomorrow') date.setDate(date.getDate() + 1);
-  let hour = Number(match[2]) % 12; if (match[4].toLowerCase() === 'pm') hour += 12;
-  date.setHours(hour, Number(match[3] || 0), 0, 0);
-  return { recipientName: match[1].trim(), title: match[6].trim(), due: `${isoDate(date)}T${String(hour).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}` };
+  const recipientName = match[1].trim();
+  const dateLabel = dateFirst ? match[2] : match[5];
+  const hourPart = dateFirst ? match[3] : match[2];
+  const minutePart = dateFirst ? match[4] : match[3];
+  const meridiem = dateFirst ? match[5] : match[4];
+  const message = dateFirst ? match[6] : match[6];
+  const date = new Date(); if (dateLabel.toLowerCase() === 'tomorrow') date.setDate(date.getDate() + 1);
+  let hour = Number(hourPart) % 12; if (meridiem.toLowerCase() === 'pm') hour += 12;
+  date.setHours(hour, Number(minutePart || 0), 0, 0);
+  return { recipientName, title: message.trim(), due: `${isoDate(date)}T${String(hour).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}` };
 };
 const emptyTask = (defaults = {}) => ({
   title: '', description: '', start: defaults.start || localToday(),
@@ -83,6 +99,9 @@ function App() {
   const [pendingReminder, setPendingReminder] = useState(() => { try { return JSON.parse(sessionStorage.getItem('spectre.pending-reminder') || 'null'); } catch { return null; } });
   const [recipientDraft, setRecipientDraft] = useState({ name: '', email: '' });
   const [scheduledActions, setScheduledActions] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [view, setView] = useState('today');
   const [navOpen, setNavOpen] = useState(false);
   const [selectedFolder, setSelectedFolder] = useState('');
@@ -93,6 +112,7 @@ function App() {
   const [sort, setSort] = useState('manual');
   const [filters, setFilters] = useState({ status: '', priority: '', tag: '', folder: '', date: '' });
   const [modal, setModal] = useState(null);
+  const [assistantOpen, setAssistantOpen] = useState(false);
   const [feedback, setFeedback] = useState({ kind: 'success', title: '', message: '' });
   const [dueAlert, setDueAlert] = useState(null);
   const [taskDraft, setTaskDraft] = useState(null);
@@ -119,6 +139,13 @@ function App() {
     setModal('feedback');
   }, []);
 
+  const refreshNotifications = useCallback(async () => {
+    const result = await api('/notifications');
+    setNotifications(result.notifications || []);
+    setUnreadNotificationCount(result.unreadCount || 0);
+    return result;
+  }, []);
+
   const reload = useCallback(async () => {
     try {
       const user = await api('/auth/me');
@@ -129,11 +156,20 @@ function App() {
       if (![nextTasks, nextFolders, nextTags, nextNotes].every(Array.isArray) || !profile?.username) throw new Error('The API returned an unexpected response. Restart the updated NestJS server and try again.');
       setTasks(nextTasks); setFolders(nextFolders); setTags(nextTags); setNotes(nextNotes);
       setUsername(profile.username); setAuthUser(user); setError('');
+      if (user) {
+        try { const result = await api('/notifications'); setNotifications(result.notifications || []); setUnreadNotificationCount(result.unreadCount || 0); }
+        catch (notificationError) { console.warn('[Spectre] Could not load notifications:', notificationError.message); }
+      } else { setNotifications([]); setUnreadNotificationCount(0); }
     } catch (err) { setError(err.message); }
     finally { setLoading(false); }
   }, []);
 
   useEffect(() => { reload(); }, [reload]);
+  useEffect(() => {
+    if (!authUser) return undefined;
+    const timer = window.setInterval(() => { refreshNotifications().catch((err) => console.warn('[Spectre] Could not refresh notifications:', err.message)); }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [authUser, refreshNotifications]);
   useEffect(() => { if (pendingReminder) sessionStorage.setItem('spectre.pending-reminder', JSON.stringify(pendingReminder)); else sessionStorage.removeItem('spectre.pending-reminder'); }, [pendingReminder]);
   useEffect(() => { if (!loading && pendingReminder && !modal) setModal(authUser ? (pendingReminder.recipientEmail ? 'reminder-confirm' : 'recipient') : 'auth'); }, [loading, pendingReminder, authUser, modal]);
   useEffect(() => { if (passwordResetToken) setModal('password-reset'); }, [passwordResetToken]);
@@ -236,7 +272,7 @@ function App() {
       await reload();
       setGuestTransferSummary(null);
       setModal(null);
-      if (pendingReminder) setModal('recipient');
+      if (pendingReminder) { if (transfer) setPendingReminder((current) => current ? { ...current, taskId: result.taskIdMap?.[current.taskId] || null } : current); else setPendingReminder((current) => current ? { ...current, taskId: null } : current); setModal('recipient'); }
       else if (transfer) showFeedback('success', `Transferred ${result.tasksTransferred} task${result.tasksTransferred === 1 ? '' : 's'} and ${result.notesTransferred} note${result.notesTransferred === 1 ? '' : 's'}. Existing account items were preserved.`);
       else showFeedback('success', 'You are signed in. Your guest data remains on this device.');
     } catch (err) { showFeedback('error', err.message); }
@@ -269,7 +305,7 @@ function App() {
     if (!pendingReminder || !authUser) return;
     setBusyAction('schedule-reminder');
     try {
-      const scheduled = await api('/scheduled-actions', { method: 'POST', body: { clientRequestId: pendingReminder.requestId, recipientName: pendingReminder.recipientName, recipientEmail: pendingReminder.recipientEmail, subject: `Reminder: ${pendingReminder.title}`, message: pendingReminder.message, scheduledAt: pendingReminder.scheduledAt, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, confirmed: true } });
+      const scheduled = await api('/scheduled-actions', { method: 'POST', body: { clientRequestId: pendingReminder.requestId, taskId: pendingReminder.taskId || null, recipientName: pendingReminder.recipientName, recipientEmail: pendingReminder.recipientEmail, subject: `Reminder: ${pendingReminder.title}`, message: pendingReminder.message, scheduledAt: pendingReminder.scheduledAt, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, confirmed: true } });
       setModal(null);
       setPendingReminder(null); setRecipientDraft({ name: '', email: '' });
       setScheduledActions(await api('/scheduled-actions'));
@@ -283,6 +319,36 @@ function App() {
     try { setScheduledActions(await api('/scheduled-actions')); setModal('scheduled-actions'); }
     catch (err) { showFeedback('error', err.message); }
     finally { setBusyAction(''); }
+  }
+  async function cancelScheduledAction(action) {
+    setBusyAction(`cancel-action-${action.id}`);
+    try { await api(`/scheduled-actions/${action.id}/cancel`, { method: 'POST' }); setScheduledActions(await api('/scheduled-actions')); notify('Reminder cancelled.'); }
+    catch (err) { showFeedback('error', err.message); }
+    finally { setBusyAction(''); }
+  }
+  async function revokeReminderLink(action) {
+    setBusyAction(`revoke-link-${action.id}`);
+    try { await api(`/scheduled-actions/${action.id}/revoke-link`, { method: 'POST' }); setScheduledActions(await api('/scheduled-actions')); notify('Guest link revoked.'); }
+    catch (err) { showFeedback('error', err.message); }
+    finally { setBusyAction(''); }
+  }
+  async function openNotification(notification) {
+    setNotificationsOpen(false);
+    try {
+      if (!notification.readAt) {
+        await api(`/notifications/${notification.id}/read`, { method: 'PATCH' });
+        setNotifications((current) => current.map((item) => item.id === notification.id ? { ...item, readAt: Date.now() } : item));
+        setUnreadNotificationCount((count) => Math.max(0, count - 1));
+      }
+      if (notification.relatedTaskId) {
+        const task = tasks.find((item) => item.id === notification.relatedTaskId) || await api(`/tasks/${notification.relatedTaskId}`);
+        setSelectedTask(task);
+      } else if (notification.relatedScheduledActionId) await showScheduledActions();
+    } catch (err) { showFeedback('error', err.message); }
+  }
+  async function markAllNotificationsRead() {
+    try { await api('/notifications/read-all', { method: 'POST' }); setNotifications((current) => current.map((item) => ({ ...item, readAt: item.readAt || Date.now() }))); setUnreadNotificationCount(0); }
+    catch (err) { showFeedback('error', err.message); }
   }
   async function signOut() { setBusyAction('sign-out'); try { await api('/auth/logout', { method: 'POST' }); setAuthUser(null); setFeedback({ kind: 'success', title: 'Signed out', message: 'You have been signed out successfully.' }); setModal('feedback'); await reload(); } catch (err) { setFeedback({ kind: 'error', title: 'Sign out failed', message: err.message }); setModal('feedback'); } finally { setBusyAction(''); } }
   async function toggleTask(task) {
@@ -367,17 +433,18 @@ function App() {
     </aside>
 
     <main className="center">
-      <header className="topline"><div className="top-heading"><div className="date-kicker">{fmtDate(new Date(), { weekday: 'long', month: 'long', day: 'numeric' })}</div><h1>{viewTitle[0]}<span>{viewTitle[1]}</span></h1></div><div className="top-actions"><AppButton className="primary-add" onClick={() => startCreateTask()}>＋ New task</AppButton><AppButton className="username-button" title="Change username" onClick={() => { setUsernameDraft(username); setModal('username'); }}>{username}</AppButton><AppButton className="username-button" title={authUser ? 'Sign out' : 'Sign up or log in'} onClick={() => authUser ? setModal('signout-confirm') : (setAuthMode('signup'), setModal('auth'))}>{authUser ? 'Sign out' : 'Account'}</AppButton><AppButton className="iconbtn" title="Scheduled actions" loading={busyAction === 'load-scheduled'} onClick={showScheduledActions}>♧</AppButton><AppButton className="iconbtn" title="Toggle theme" onClick={() => setDark((value) => !value)}>◐</AppButton><AppButton className="iconbtn mobile-menu" title="Open navigation" aria-expanded={navOpen} onClick={() => setNavOpen((value) => !value)}>☰</AppButton><AppButton className="iconbtn" title="Notes" onClick={() => setModal('notes')}>▤</AppButton></div></header>
+      <header className="topline"><div className="top-heading"><div className="date-kicker">{fmtDate(new Date(), { weekday: 'long', month: 'long', day: 'numeric' })}</div><h1>{viewTitle[0]}<span>{viewTitle[1]}</span></h1></div><div className="top-actions"><AppButton className="primary-add" onClick={() => startCreateTask()}>＋ New task</AppButton><AppButton className="assistant-trigger" onClick={() => setAssistantOpen(true)}>✦ Assistant</AppButton><AppButton className="username-button" title="Change username" onClick={() => { setUsernameDraft(username); setModal('username'); }}>{username}</AppButton><AppButton className="username-button" title={authUser ? 'Sign out' : 'Sign up or log in'} onClick={() => authUser ? setModal('signout-confirm') : (setAuthMode('signup'), setModal('auth'))}>{authUser ? 'Sign out' : 'Account'}</AppButton>{authUser && <div className="notification-wrap"><AppButton className="iconbtn notification-trigger" title="Notifications" aria-label={`Notifications${unreadNotificationCount ? `, ${unreadNotificationCount} unread` : ''}`} aria-expanded={notificationsOpen} onClick={async () => { const next = !notificationsOpen; setNotificationsOpen(next); if (next) { try { await refreshNotifications(); } catch (err) { showFeedback('error', err.message); } } }}>♢{unreadNotificationCount > 0 && <span className="notification-count">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>}</AppButton>{notificationsOpen && <section className="notification-panel" aria-label="Notifications"><div className="notification-panel-head"><strong>Notifications</strong>{unreadNotificationCount > 0 && <AppButton className="text-link" onClick={markAllNotificationsRead}>Mark all read</AppButton>}</div>{notifications.length ? notifications.map((notification) => <AppButton key={notification.id} className={`notification-item ${notification.readAt ? '' : 'unread'}`} onClick={() => openNotification(notification)}><strong>{notification.title}</strong><span>{notification.message}</span><small>{fmtDate(notification.createdAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></AppButton>) : <div className="notification-empty">You’re all caught up.</div>}</section>}</div>}<AppButton className="iconbtn" title="Scheduled actions" loading={busyAction === 'load-scheduled'} onClick={showScheduledActions}>♧</AppButton><AppButton className="iconbtn" title="Toggle theme" onClick={() => setDark((value) => !value)}>◐</AppButton><AppButton className="iconbtn mobile-menu" title="Open navigation" aria-expanded={navOpen} onClick={() => setNavOpen((value) => !value)}>☰</AppButton><AppButton className="iconbtn" title="Notes" onClick={() => setModal('notes')}>▤</AppButton></div></header>
       <section className="progressbox"><div className="progress-icon">✳</div><div className="progress-copy"><div className="progress-title">{percentDone === 100 ? 'Beautifully done' : tasks.length - totalDone ? `${tasks.length - totalDone} ${tasks.length - totalDone === 1 ? 'task' : 'tasks'} in your hands` : 'A fresh start'}</div><div className="progress-sub">{totalDone ? `${totalDone} ${totalDone === 1 ? 'task' : 'tasks'} completed — keep going.` : 'Small steps make a meaningful day.'}</div></div><div className="progress-track"><div className="progress-fill" style={{ width: `${percentDone}%` }} /></div><div className="progress-num">{percentDone}%</div></section>
       {view !== 'calendar' ? <>
         <div className="toolbar"><h2>{listTitle}</h2><div className="toolbar-actions"><TextInput className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by title" aria-label="Search tasks by title" /><select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort tasks"><option value="manual">Manual order</option><option value="due">Due date</option><option value="priority">Priority</option><option value="created">Creation date</option><option value="alpha">Alphabetical</option></select></div></div>
-        <div className="filters"><AppButton className="create-tag-btn" onClick={openTagForm}>＋ Create tag</AppButton><select aria-label="Filter status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="">Any status</option>{['To Do', 'In Progress', 'Completed'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter priority" value={filters.priority} onChange={(event) => setFilters({ ...filters, priority: event.target.value })}><option value="">Any priority</option>{['High', 'Medium', 'Low'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter tag" value={filters.tag} onChange={(event) => setFilters({ ...filters, tag: event.target.value })}><option value="">Any tag</option>{tags.map((tag) => <option key={tag}>{tag}</option>)}</select><select aria-label="Filter folder" value={filters.folder} onChange={(event) => setFilters({ ...filters, folder: event.target.value })}><option value="">Any folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select><select aria-label="Filter date" value={filters.date} onChange={(event) => setFilters({ ...filters, date: event.target.value })}><option value="">Any date</option><option value="overdue">Overdue</option><option value="today">Due today</option><option value="week">Next 7 days</option><option value="none">No due date</option></select></div>
+        <div className="filters"><AppButton className="create-tag-btn" onClick={openTagForm}>＋ Create tag</AppButton><select aria-label="Filter status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="">Any status</option>{['To Do', 'Pending', 'Acknowledged', 'In Progress', 'Completed'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter priority" value={filters.priority} onChange={(event) => setFilters({ ...filters, priority: event.target.value })}><option value="">Any priority</option>{['High', 'Medium', 'Low'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter tag" value={filters.tag} onChange={(event) => setFilters({ ...filters, tag: event.target.value })}><option value="">Any tag</option>{tags.map((tag) => <option key={tag}>{tag}</option>)}</select><select aria-label="Filter folder" value={filters.folder} onChange={(event) => setFilters({ ...filters, folder: event.target.value })}><option value="">Any folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select><select aria-label="Filter date" value={filters.date} onChange={(event) => setFilters({ ...filters, date: event.target.value })}><option value="">Any date</option><option value="overdue">Overdue</option><option value="today">Due today</option><option value="week">Next 7 days</option><option value="none">No due date</option></select></div>
         <section className="task-list" aria-label="Tasks">{loading ? <div className="empty">Loading your tasks…</div> : error ? <div className="empty"><strong>Could not load Spectre</strong><span>{error}</span><AppButton className="save-task" onClick={reload}>Retry</AppButton></div> : visibleTasks.length ? visibleTasks.map((task) => <TaskCard key={task.id} task={task} onToggle={toggleTask} onEdit={() => editTask(task)} onOpen={() => setSelectedTask(task)} onDrop={moveTask} />) : <div className="empty"><strong>{search ? 'No matching tasks' : view === 'folder' ? 'This folder is empty' : view === 'tag' ? 'No tasks use this tag yet' : view === 'completed' ? 'No completed tasks yet' : 'No tasks to show'}</strong><span>{view === 'folder' ? 'Create a task in this folder to get started.' : view === 'tag' ? 'Create a task with this tag to get started.' : search ? 'Clear your search or add a new task.' : 'Add a task whenever you’re ready.'}</span><div className="empty-actions"><AppButton className="save-task" onClick={() => startCreateTask({ folder: view === 'folder' ? selectedFolder : '', tag: view === 'tag' ? selectedTag : '' })}>Create task</AppButton></div></div>}</section>
       </> : <CalendarView tasks={tasks} month={month} setMonth={setMonth} selectedDay={selectedDay} setSelectedDay={setSelectedDay} onCreate={(day = selectedDay) => { setSelectedDay(day); setMonth(new Date(`${day}T12:00:00`)); startCreateTask({ start: day, due: `${day}T09:00` }); }} onOpen={setSelectedTask} onToggle={toggleTask} onEdit={editTask} />}
     </main>
 
     <aside className={`notes-drawer ${modal === 'notes' ? 'open' : ''}`}><div className="drawer-head"><h2>Notes</h2><AppButton className="iconbtn" aria-label="Close notes" onClick={() => setModal(null)}>×</AppButton></div><AppButton className="add-inline" onClick={() => { setNoteDraft({ title: '', text: '' }); setNoteEditId(null); setModal('note'); }}>＋ Write a note</AppButton>{notes.length ? notes.map((note) => <article className="note-card" key={note.id}><div className="note-top"><strong>{note.title || 'Quick note'}</strong><div><AppButton className="note-del" title="Edit note" onClick={() => editNote(note)}>✎</AppButton><AppButton className="note-del" title="Delete note" loading={busyAction === `delete-note-${note.id}`} onClick={() => removeNote(note)}>×</AppButton></div></div><div className="note-date">{fmtDate(note.createdAt)}</div><p>{note.text}</p></article>) : <div className="empty mini-empty"><strong>No notes yet</strong><span>Write a note to keep an idea handy.</span><AppButton className="save-task" onClick={() => { setNoteDraft({ title: '', text: '' }); setNoteEditId(null); setModal('note'); }}>Create note</AppButton></div>}</aside>
 
+    <AssistantPanel open={assistantOpen} onClose={() => setAssistantOpen(false)} authUser={authUser} onRequireAuth={() => { setAssistantOpen(true); setAuthMode('signup'); setAuthDraft({ email: '', password: '' }); setModal('auth'); }} onCompleted={async () => { await reload(); showFeedback('success', 'Reminder created.'); }} onShowScheduledActions={showScheduledActions} />
     {modal === 'task' && taskDraft && <Modal title={editingId ? 'Edit task' : 'New task'} onClose={() => setModal(null)}><form className="task-form" onSubmit={saveTask}>
       <label className="field full">Task title *<TextInput required maxLength="140" value={taskDraft.title} onChange={(event) => setTaskDraft({ ...taskDraft, title: event.target.value })} placeholder="What needs to get done?" /></label><p className="field-hint">You can also write: “Remind Michael at 4 PM today to complete the design.”</p>
       <div className="form-grid"><label className="field">Start date *<TextInput type="date" required value={taskDraft.start} onChange={(event) => setTaskDraft({ ...taskDraft, start: event.target.value })} /></label><label className="field">Due date & time *<TextInput type="datetime-local" required value={taskDraft.due} onChange={(event) => setTaskDraft({ ...taskDraft, due: event.target.value })} /></label><label className="field">Status *<select value={taskDraft.status} onChange={(event) => setTaskDraft({ ...taskDraft, status: event.target.value })}>{['To Do', 'In Progress', 'Completed'].map((item) => <option key={item}>{item}</option>)}</select></label><label className="field">Priority *<select value={taskDraft.priority} onChange={(event) => setTaskDraft({ ...taskDraft, priority: event.target.value })}>{['High', 'Medium', 'Low'].map((item) => <option key={item}>{item}</option>)}</select></label></div>
@@ -389,7 +456,7 @@ function App() {
     {modal === 'guest-transfer' && <Modal title="Transfer your guest tasks?" onClose={() => finishGuestTransition(false)}><p className="auth-copy">This device has {guestTransferSummary?.tasks || 0} task{guestTransferSummary?.tasks === 1 ? '' : 's'} and {guestTransferSummary?.notes || 0} note{guestTransferSummary?.notes === 1 ? '' : 's'} saved as a guest. You can merge them into this account. Existing account data stays intact and matching tasks are skipped.</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" loading={busyAction === 'finish-signin'} onClick={() => finishGuestTransition(false)}>Keep separate</AppButton><AppButton className="save-task" loading={busyAction === 'guest-transfer'} onClick={() => finishGuestTransition(true)}>Transfer guest data</AppButton></div></Modal>}
     {modal === 'recipient' && pendingReminder && <Modal title="Who should receive this reminder?" onClose={() => setModal(null)}><p className="auth-copy">Your task is saved. Add the recipient details before scheduling the email.</p><form className="task-form" onSubmit={continueToConfirmation}><label className="field">Name<TextInput required maxLength="200" value={recipientDraft.name} onChange={(event) => setRecipientDraft({ ...recipientDraft, name: event.target.value })} placeholder="Michael" /></label><label className="field">Email<TextInput required type="email" value={recipientDraft.email} onChange={(event) => setRecipientDraft({ ...recipientDraft, email: event.target.value })} placeholder="michael@example.com" /></label><div className="modal-actions"><AppButton type="button" className="secondary-button" onClick={() => { setModal(null); setPendingReminder(null); }}>Cancel reminder</AppButton><AppButton className="save-task">Continue</AppButton></div></form></Modal>}
     {modal === 'reminder-confirm' && pendingReminder && <Modal title="Confirm email reminder" onClose={() => setModal('recipient')}><div className="reminder-summary"><strong>{pendingReminder.recipientName}</strong><span>{pendingReminder.recipientEmail}</span><p>{pendingReminder.message}</p><span>{fmtDate(pendingReminder.scheduledAt, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · {Intl.DateTimeFormat().resolvedOptions().timeZone}</span></div><div className="modal-actions"><AppButton className="secondary-button" onClick={() => setModal('recipient')}>Edit recipient</AppButton><AppButton className="save-task" loading={busyAction === 'schedule-reminder'} onClick={scheduleReminder}>{busyAction === 'schedule-reminder' ? 'Scheduling…' : 'Schedule reminder'}</AppButton></div></Modal>}
-    {modal === 'scheduled-actions' && <Modal title="Scheduled actions" onClose={() => setModal(null)}>{scheduledActions.length ? <div className="scheduled-list">{scheduledActions.map((action) => <article className="note-card" key={action.id}><div className="note-top"><strong>{action.subject}</strong><span className="pill status">{action.status}</span></div><p>{action.recipientName} · {action.recipientEmail}</p><div className="note-date">{fmtDate(action.scheduledAt, { month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })} · {action.timezone}</div>{action.failureReason && <p className="failure-reason">{action.failureReason}</p>}</article>)}</div> : <div className="empty"><strong>No scheduled reminders</strong><span>Create an email reminder from a task's optional details.</span></div>}</Modal>}
+    {modal === 'scheduled-actions' && <Modal title="Scheduled actions" onClose={() => setModal(null)}>{scheduledActions.length ? <div className="scheduled-list">{scheduledActions.map((action) => <article className="note-card scheduled-reminder-card" key={action.id}><div className="note-top"><strong>Reminder to {action.recipientName}</strong><span className={`pill status status-${action.status}`}>{deliveryStatusLabel(action.status)}</span></div><p><strong>Recipient:</strong> {action.recipientEmail}</p><p><strong>Message:</strong> {action.message}</p><div className="note-date"><strong>Scheduled:</strong> {fmtDate(action.scheduledAt, { month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })} · {action.timezone}</div><p><strong>Email:</strong> {action.status === 'sent' || action.status === 'completed' ? `Accepted by provider${action.emailSentAt ? ` · ${fmtDate(action.emailSentAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : ''}` : deliveryStatusLabel(action.status)}</p><p><strong>Acknowledgment:</strong> {action.acknowledgedAt ? `Acknowledged · ${fmtDate(action.acknowledgedAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : 'Not acknowledged'}</p><p><strong>Task:</strong> {action.taskStatus || (action.taskId ? 'Unavailable' : 'No linked task')}</p>{action.failureReason && <p className="failure-reason">{action.failureReason}{action.attemptCount ? ` (attempt ${action.attemptCount})` : ''}</p>}{(action.status === 'scheduled' || action.status === 'failed') && <div className="scheduled-actions-buttons">{action.status === 'scheduled' && <AppButton className="secondary-button" loading={busyAction === `cancel-action-${action.id}`} onClick={() => cancelScheduledAction(action)}>Cancel reminder</AppButton>}<AppButton className="secondary-button" loading={busyAction === `revoke-link-${action.id}`} onClick={() => revokeReminderLink(action)}>Revoke guest link</AppButton></div>}</article>)}</div> : <div className="empty"><strong>No scheduled reminders</strong><span>Create an email reminder from a task's optional details.</span></div>}</Modal>}
     {modal === 'signout-confirm' && <Modal title="Sign out?" onClose={() => setModal(null)}><p className="auth-copy">You can continue using Spectre as a guest on this device.</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => setModal(null)}>Cancel</AppButton><AppButton className="save-task" loading={busyAction === 'sign-out'} onClick={signOut}>{busyAction === 'sign-out' ? 'Signing out…' : 'Sign out'}</AppButton></div></Modal>}
     {modal === 'feedback' && <Modal title={feedback.title} onClose={() => setModal(null)}><p className={`feedback-copy ${feedback.kind}`}>{feedback.message}</p><div className="modal-actions auth-actions"><AppButton className="save-task" onClick={() => setModal(null)}>Done</AppButton></div></Modal>}
     {dueAlert && <Modal title="Task due now" onClose={() => setDueAlert(null)}><div className="due-alert"><strong>{dueAlert.title}</strong>{dueAlert.description && <p>{dueAlert.description}</p>}<span>Due {fmtDate(dueAlert.due, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span></div><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => setDueAlert(null)}>Dismiss</AppButton><AppButton className="save-task" onClick={() => { setSelectedTask(dueAlert); setDueAlert(null); }}>View task</AppButton></div></Modal>}
@@ -405,9 +472,132 @@ function App() {
 const AppButton = ({ className = '', loading = false, children, ...props }) => <button className={`app-button ${className}`} disabled={loading || props.disabled} aria-busy={loading || undefined} {...props}>{loading && <span className="button-spinner" aria-hidden="true" />}{children}</button>;
 const TextInput = ({ className = '', ...props }) => <input className={`app-input ${className}`} {...props} />;
 
+function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, onShowScheduledActions }) {
+  const restore = () => { try { return JSON.parse(sessionStorage.getItem('spectre.voice-assistant-session') || '{}'); } catch { return {}; } };
+  const saved = useMemo(restore, []);
+  const [messages, setMessages] = useState(Array.isArray(saved.messages) ? saved.messages : [{ role: 'assistant', content: 'Hi, I’m Spectre. Tell me what you’d like to remember, or ask me to email someone a reminder.' }]);
+  const [draft, setDraft] = useState(saved.draft || null);
+  const [transcript, setTranscript] = useState('');
+  const [phase, setPhase] = useState('idle');
+  const [error, setError] = useState('');
+  const [muted, setMuted] = useState(false);
+  const [recognitionAvailable, setRecognitionAvailable] = useState(false);
+  const recognitionRef = React.useRef(null);
+  const shouldInterpretRef = React.useRef(false);
+  const finalTranscriptRef = React.useRef('');
+  const [manual, setManual] = useState(false);
+  const [manualType, setManualType] = useState('personal_reminder');
+
+  useEffect(() => { sessionStorage.setItem('spectre.voice-assistant-session', JSON.stringify({ messages: messages.slice(-30), draft })); }, [messages, draft]);
+  useEffect(() => { setRecognitionAvailable(Boolean(window.SpeechRecognition || window.webkitSpeechRecognition)); }, []);
+  useEffect(() => () => { recognitionRef.current?.abort?.(); window.speechSynthesis?.cancel(); }, []);
+
+  function speak(text) {
+    if (muted || !window.speechSynthesis || !window.SpeechSynthesisUtterance) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.onstart = () => setPhase('speaking');
+    utterance.onend = () => setPhase('waiting');
+    utterance.onerror = () => setPhase('waiting');
+    window.speechSynthesis.speak(utterance);
+  }
+  function addAssistant(text) { setMessages((current) => [...current, { role: 'assistant', content: text }]); speak(text); }
+  async function interpret(text) {
+    const clean = text.trim(); if (!clean) return;
+    setError(''); setManual(false); setPhase('processing');
+    const nextMessages = [...messages, { role: 'user', content: clean }];
+    setMessages(nextMessages);
+    try {
+      const result = await api('/assistant/interpret', { method: 'POST', body: { transcript: clean, messages: nextMessages.slice(-8), currentDraft: draft, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone } });
+      setDraft(result.draft || null);
+      if (result.intent === 'cancel') { setDraft(null); addAssistant(result.assistantText); }
+      else if (result.intent === 'confirm' && result.ready && result.draft) { setDraft(result.draft); addAssistant(result.draft.actionType === 'schedule_email' && !authUser ? 'That email reminder needs an account. Sign in or create one, then confirm it to schedule.' : 'Confirmed. I’m creating your reminder now.'); await execute(result.draft); }
+      else addAssistant(result.assistantText || 'What would you like me to change?');
+      setPhase(result.ready ? 'waiting' : 'waiting');
+    } catch (err) { setError(err.message); setPhase('error'); addAssistant(`I couldn’t process that: ${err.message}`); }
+  }
+  function startListening() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) { setError('Voice recognition is not available in this browser. Type your request below.'); return; }
+    window.speechSynthesis?.cancel(); finalTranscriptRef.current = ''; shouldInterpretRef.current = true; setTranscript(''); setError(''); setPhase('listening');
+    const recognition = new SpeechRecognition(); recognitionRef.current = recognition; recognition.continuous = false; recognition.interimResults = true; recognition.lang = navigator.language || 'en-US';
+    recognition.onresult = (event) => { let finalText = ''; let interim = ''; for (let i = event.resultIndex; i < event.results.length; i += 1) { if (event.results[i].isFinal) finalText += event.results[i][0].transcript; else interim += event.results[i][0].transcript; } if (finalText) finalTranscriptRef.current += `${finalTranscriptRef.current ? ' ' : ''}${finalText}`; setTranscript(`${finalTranscriptRef.current}${interim ? `${finalTranscriptRef.current ? ' ' : ''}${interim}` : ''}`); };
+    recognition.onerror = (event) => { shouldInterpretRef.current = false; setPhase('error'); setError(event.error === 'not-allowed' ? 'Microphone permission was denied. You can type your request instead.' : `Voice input stopped (${event.error}). You can type your request instead.`); };
+    recognition.onend = () => { recognitionRef.current = null; const text = finalTranscriptRef.current.trim(); setPhase('idle'); if (shouldInterpretRef.current && text) { setTranscript(''); void interpret(text); } };
+    try { recognition.start(); } catch { setPhase('error'); setError('Could not start voice input. Type your request instead.'); }
+  }
+  function stopListening() { shouldInterpretRef.current = true; recognitionRef.current?.stop(); }
+  function interrupt() { shouldInterpretRef.current = false; recognitionRef.current?.abort?.(); recognitionRef.current = null; window.speechSynthesis?.cancel(); setPhase('waiting'); }
+  async function execute(actionDraft) {
+    if (actionDraft.actionType === 'schedule_email' && !authUser) { setPhase('waiting'); addAssistant('This reminder needs an account. Your draft is saved here. Sign in or create an account, then confirm it to schedule.'); onRequireAuth(); return; }
+    setPhase('executing'); setError('');
+    try {
+      if (actionDraft.actionType === 'personal_reminder') {
+        await api('/tasks', { method: 'POST', body: { assistantDraftId: actionDraft.draftId, title: actionDraft.title || actionDraft.message, description: actionDraft.message || '', start: actionDraft.scheduledDate, due: new Date(`${actionDraft.scheduledDate}T${actionDraft.scheduledTime}`).toISOString(), status: 'To Do', priority: 'Medium', reminder: 'at-due', emailReminder: false, tags: [], subtasks: [], attachments: [], notes: '', folder: '', recurrence: '' } });
+      } else {
+        await api('/scheduled-actions', { method: 'POST', body: { clientRequestId: actionDraft.draftId, taskId: null, recipientName: actionDraft.recipientName, recipientEmail: actionDraft.recipientEmail, subject: `Reminder: ${actionDraft.message.slice(0, 120)}`, message: actionDraft.message, scheduledAt: new Date(`${actionDraft.scheduledDate}T${actionDraft.scheduledTime}`).toISOString(), timezone: actionDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone, confirmed: true } });
+      }
+      setPhase('success'); setDraft(null); sessionStorage.removeItem('spectre.voice-assistant-session');
+      addAssistant(actionDraft.actionType === 'personal_reminder' ? 'Your personal reminder is set.' : `Your email reminder to ${actionDraft.recipientName} is scheduled.`);
+      await onCompleted();
+    } catch (err) { setError(err.message); setPhase('error'); addAssistant(`I couldn’t create the reminder: ${err.message}`); }
+  }
+  function confirmDraft() { if (draft) void execute(draft); }
+  function cancelDraft() { interrupt(); setDraft(null); setManual(false); setError(''); setPhase('waiting'); sessionStorage.removeItem('spectre.voice-assistant-session'); addAssistant('Okay, I cancelled this reminder draft. Nothing was created.'); }
+  function saveManual(event) {
+    event.preventDefault(); const data = new FormData(event.currentTarget); const next = { draftId: draft?.draftId || crypto.randomUUID(), actionType: manualType, title: String(data.get('title') || '').trim(), message: String(data.get('message') || '').trim(), recipientName: String(data.get('recipientName') || '').trim(), recipientEmail: String(data.get('recipientEmail') || '').trim(), scheduledDate: String(data.get('scheduledDate') || ''), scheduledTime: String(data.get('scheduledTime') || ''), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
+    if (next.actionType === 'personal_reminder') next.title ||= next.message;
+    if (next.actionType === 'schedule_email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next.recipientEmail)) { setError('Enter a valid recipient email address.'); return; }
+    if (!next.title && next.actionType === 'personal_reminder' || !next.message && next.actionType === 'schedule_email' || !next.scheduledDate || !next.scheduledTime || next.actionType === 'schedule_email' && !next.recipientName) { setError('Complete the required reminder details first.'); return; }
+    if (new Date(`${next.scheduledDate}T${next.scheduledTime}`).getTime() <= Date.now()) { setError('Choose a future date and time.'); return; }
+    setDraft(next); setManual(false); setError(''); setPhase('waiting');
+    const summary = next.actionType === 'schedule_email' ? `I’ll email ${next.recipientName} at ${next.recipientEmail} on ${next.scheduledDate} at ${next.scheduledTime}: “${next.message}”. Please confirm to schedule it.` : `I’ll remind you on ${next.scheduledDate} at ${next.scheduledTime} to ${next.title}. Please confirm to create it.`;
+    addAssistant(summary);
+  }
+  if (!open) return null;
+  const ready = Boolean(draft && draft.scheduledDate && draft.scheduledTime && (draft.actionType === 'schedule_email' ? draft.recipientName && draft.recipientEmail && draft.message : draft.title || draft.message));
+  return <Modal title="Spectre Assistant" onClose={onClose}><div className="assistant-panel">
+    <div className="assistant-state" role="status"><span className={`assistant-state-dot ${phase}`} />{({ idle: 'Ready when you are', listening: 'Listening…', processing: 'Understanding your request…', speaking: 'Speaking…', waiting: 'Waiting for your response', executing: 'Creating reminder…', success: 'Reminder created', error: 'Needs attention' })[phase]}</div>
+    <div className="assistant-conversation" aria-live="polite">{messages.slice(-12).map((message, index) => <div className={`assistant-message ${message.role}`} key={`${index}-${message.content}`}><strong>{message.role === 'assistant' ? 'Spectre' : 'You'}</strong><p>{message.content}</p></div>)}</div>
+    {draft && (manual || phase !== 'success') && <><div className="assistant-draft"><strong>{draft.actionType === 'schedule_email' ? 'Email reminder draft' : 'Personal reminder draft'}</strong><span>{draft.title || draft.message || 'Add reminder details'}</span><small>{draft.scheduledDate || 'Date needed'} {draft.scheduledTime || 'Time needed'} · {draft.timezone}</small>{draft.actionType === 'schedule_email' && <small>{draft.recipientName || 'Recipient needed'} · {draft.recipientEmail || 'Email needed'}</small>}</div>{manual && <form className="assistant-edit-form" onSubmit={saveManual}><label className="field">Reminder type<select name="actionType" value={manualType} onChange={(event) => setManualType(event.target.value)}><option value="personal_reminder">Personal reminder</option><option value="schedule_email">Email reminder</option></select></label>{manualType === 'schedule_email' && <><label className="field">Recipient name<TextInput name="recipientName" defaultValue={draft.recipientName || ''} /></label><label className="field">Recipient email<TextInput name="recipientEmail" type="email" defaultValue={draft.recipientEmail || ''} /></label></>}<label className="field">What should the reminder say?<TextInput name={manualType === 'personal_reminder' ? 'title' : 'message'} required defaultValue={manualType === 'personal_reminder' ? draft.title || draft.message || '' : draft.message || draft.title || ''} /></label><label className="field">Date<TextInput name="scheduledDate" type="date" required defaultValue={draft.scheduledDate || ''} /></label><label className="field">Time<TextInput name="scheduledTime" type="time" required defaultValue={draft.scheduledTime || ''} /></label><div className="modal-actions"><AppButton type="button" className="secondary-button" onClick={() => setManual(false)}>Back</AppButton><AppButton className="save-task">Save draft</AppButton></div></form>}</>}
+    {error && <p className="assistant-error" role="alert">{error}</p>}
+    {phase === 'success' && <div className="assistant-success-actions"><AppButton className="secondary-button" onClick={onShowScheduledActions}>View scheduled actions</AppButton><AppButton className="save-task" onClick={() => { setMessages([{ role: 'assistant', content: 'What would you like to remember next?' }]); setPhase('waiting'); setError(''); }}>Create another</AppButton></div>}
+    {phase !== 'success' && <><form className="assistant-input-row" onSubmit={(event) => { event.preventDefault(); const text = transcript.trim(); if (text) { setTranscript(''); void interpret(text); } }}><TextInput aria-label="Type a reminder request" placeholder="Say or type what you need to remember…" value={transcript} onChange={(event) => setTranscript(event.target.value)} /><AppButton className="save-task" loading={phase === 'processing'} disabled={!transcript.trim()}>{phase === 'processing' ? 'Thinking…' : 'Send'}</AppButton></form><div className="assistant-controls">{phase === 'listening' ? <AppButton className="save-task" onClick={stopListening}>Stop listening</AppButton> : <AppButton className="secondary-button" disabled={phase === 'processing' || phase === 'executing'} onClick={startListening} title={recognitionAvailable ? 'Start voice input' : 'Voice unavailable in this browser'}>🎙 {recognitionAvailable ? 'Speak' : 'Voice unavailable'}</AppButton>}<AppButton className="secondary-button" disabled={!messages.some((message) => message.role === 'assistant') || phase === 'listening'} onClick={() => { const last = [...messages].reverse().find((message) => message.role === 'assistant'); if (last) speak(last.content); }}>Replay</AppButton><AppButton className="secondary-button" onClick={() => setMuted((value) => { if (!value) { window.speechSynthesis?.cancel(); setPhase('waiting'); } return !value; })}>{muted ? 'Unmute' : 'Mute voice'}</AppButton><AppButton className="secondary-button" onClick={interrupt}>Interrupt</AppButton>{draft && ready && !manual && <AppButton className="save-task" loading={phase === 'executing'} onClick={confirmDraft}>{phase === 'executing' ? 'Creating…' : 'Confirm reminder'}</AppButton>}{draft && !manual && <AppButton className="secondary-button" onClick={() => { setManualType(draft.actionType); setManual(true); }}>Edit details</AppButton>}{draft && <AppButton className="delete-task" onClick={cancelDraft}>Cancel draft</AppButton>}</div></>}
+  </div></Modal>;
+}
+
 function LoadingSplash() {
   return <main className="splash-screen" role="status" aria-label="Loading Spectre">
     <div className="splash-content"><span className="brand-icon splash-mark">✓</span><strong className="splash-name">Spectre</strong><span className="splash-caption">Getting your workspace ready</span><span className="splash-progress" /></div>
+  </main>;
+}
+
+function GuestReminderPage({ token }) {
+  const [reminder, setReminder] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true;
+    api('/guest/reminders/view', { method: 'POST', body: { token }, referrerPolicy: 'no-referrer' })
+      .then((data) => { if (active) setReminder(data); })
+      .catch((err) => { if (active) setError(err.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [token]);
+  async function acknowledge() {
+    setBusy(true);
+    try {
+      const result = await api('/guest/reminders/acknowledge', { method: 'POST', body: { token }, referrerPolicy: 'no-referrer' });
+      setReminder((current) => ({ ...current, ...result, acknowledgedAt: result.acknowledgedAt ? Date.parse(result.acknowledgedAt) || Date.now() : Date.now() }));
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  }
+  return <main className="guest-reminder-page">
+    <div className="guest-reminder-card" aria-live="polite">
+      <div className="brand guest-reminder-brand"><span className="brand-icon">✓</span>Spectre</div>
+      {loading ? <div className="guest-reminder-state"><span className="button-spinner" />Loading reminder…</div> : error && !reminder ? <><h1>Reminder unavailable</h1><p className="guest-reminder-copy">{error}</p><a className="app-button save-task guest-cta" href="/">Try Our App</a></> : reminder?.acknowledgedAt ? <><p className="guest-reminder-eyebrow">Thanks for letting them know</p><h1>Reminder acknowledged!</h1><p className="guest-reminder-copy">Your acknowledgment has been sent to {reminder.senderName}.</p><a className="app-button save-task guest-cta" href="/">Create Your Own Reminder</a></> : reminder ? <><p className="guest-reminder-eyebrow">A message for you</p><h1>You’ve received a reminder!</h1><div className="guest-reminder-meta"><span><small>From</small><strong>{reminder.senderName}</strong></span><span><small>To</small><strong>{reminder.recipientName}</strong></span></div><div className="guest-reminder-message"><small>Message</small><p>{reminder.message}</p></div>{error && <p className="guest-reminder-error" role="alert">{error}</p>}<AppButton className="save-task guest-cta" loading={busy} onClick={acknowledge}>{busy ? 'Sending acknowledgment…' : 'Got it'}</AppButton><p className="guest-reminder-prompt">Want to create and manage your own reminders?</p><a className="guest-app-link" href="/">Try Our App</a></> : null}
+    </div>
   </main>;
 }
 
@@ -422,7 +612,7 @@ function TaskCard({ task, onToggle, onEdit, onOpen, onDrop }) {
   }
   const overdue = task.due && new Date(task.due) < new Date() && task.status !== 'Completed';
   return <article className={`task ${task.status === 'Completed' ? 'completed' : ''} ${dragging ? 'dragging' : ''} ${toggling ? 'is-toggling' : ''}`} draggable={!toggling} onDragStart={(event) => { event.dataTransfer.setData('text/plain', task.id); setDragging(true); }} onDragEnd={() => setDragging(false)} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); onDrop(event.dataTransfer.getData('text/plain'), task.id); }} onClick={onOpen}>
-    <TextInput className="check" type="checkbox" checked={task.status === 'Completed'} disabled={toggling} onClick={(event) => event.stopPropagation()} onChange={handleToggle} aria-label="Mark task complete" aria-busy={toggling} /><div className="task-body"><div className="task-title">{task.title}</div>{task.description && <div className="task-desc">{task.description}</div>}<div className="task-meta"><span className={`pill priority-${(task.priority || 'medium').toLowerCase()}`}>{task.priority}</span>{task.status === 'In Progress' && <span className="pill status">In Progress</span>}{(task.tags || []).slice(0, 2).map((tag) => <span className="pill tag" key={tag}>{tag}</span>)}{task.folder && <span className="pill">▱ {task.folder}</span>}{task.due && <span className={`due ${overdue ? 'overdue' : ''}`}>◷ {fmtDate(task.due)}{task.due.includes('T') ? ` · ${fmtDate(task.due, { hour: 'numeric', minute: '2-digit' })}` : ''}</span>}{task.subtasks?.length > 0 && <span className="subcount">☷ {task.subtasks.filter((item) => item.done).length}/{task.subtasks.length}</span>}{task.attachments?.length > 0 && <span className="subcount">⌁ {task.attachments.length}</span>}{task.recurrence && <span className="subcount">↻ {task.recurrence}</span>}{task.emailReminder && <span className="subcount">✉ Email reminder</span>}</div></div><AppButton className="task-quick" title="Edit task" onClick={(event) => { event.stopPropagation(); onEdit(); }}>···</AppButton>
+    <TextInput className="check" type="checkbox" checked={task.status === 'Completed'} disabled={toggling} onClick={(event) => event.stopPropagation()} onChange={handleToggle} aria-label="Mark task complete" aria-busy={toggling} /><div className="task-body"><div className="task-title">{task.title}</div>{task.description && <div className="task-desc">{task.description}</div>}<div className="task-meta"><span className={`pill priority-${(task.priority || 'medium').toLowerCase()}`}>{task.priority}</span>{!['To Do', 'Completed'].includes(task.status) && <span className={`pill status ${task.status === 'Acknowledged' ? 'acknowledged' : ''}`}>{task.status}</span>}{(task.tags || []).slice(0, 2).map((tag) => <span className="pill tag" key={tag}>{tag}</span>)}{task.folder && <span className="pill">▱ {task.folder}</span>}{task.due && <span className={`due ${overdue ? 'overdue' : ''}`}>◷ {fmtDate(task.due)}{task.due.includes('T') ? ` · ${fmtDate(task.due, { hour: 'numeric', minute: '2-digit' })}` : ''}</span>}{task.subtasks?.length > 0 && <span className="subcount">☷ {task.subtasks.filter((item) => item.done).length}/{task.subtasks.length}</span>}{task.attachments?.length > 0 && <span className="subcount">⌁ {task.attachments.length}</span>}{task.recurrence && <span className="subcount">↻ {task.recurrence}</span>}{task.emailReminder && <span className="subcount">✉ Email reminder</span>}</div></div><AppButton className="task-quick" title="Edit task" onClick={(event) => { event.stopPropagation(); onEdit(); }}>···</AppButton>
   </article>;
 }
 
@@ -449,4 +639,5 @@ function Modal({ title, children, onClose }) {
   return <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-label={title}><div className="modal-top"><h2>{title}</h2><AppButton className="close" aria-label="Close" onClick={onClose}>×</AppButton></div>{children}</section></div>;
 }
 
-createRoot(document.getElementById('root')).render(<React.StrictMode><App /></React.StrictMode>);
+const guestReminderToken = getGuestReminderToken();
+createRoot(document.getElementById('root')).render(<React.StrictMode>{guestReminderToken ? <GuestReminderPage token={guestReminderToken} /> : <App />}</React.StrictMode>);

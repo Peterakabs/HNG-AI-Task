@@ -3,12 +3,13 @@ import type { Request, Response } from 'express';
 import { SpectreService } from './spectre.service';
 import { AuthService, RequestIdentity } from './auth.service';
 import { SupabaseService } from './supabase.service';
+import { VoiceAssistantService } from './voice-assistant.service';
 
 type IdentityRequest = Request & { identity?: RequestIdentity };
 
 @Controller('api')
 export class AppController {
-  constructor(private readonly service: SpectreService, private readonly auth: AuthService, private readonly supabase: SupabaseService) {}
+  constructor(private readonly service: SpectreService, private readonly auth: AuthService, private readonly supabase: SupabaseService, private readonly voice: VoiceAssistantService) {}
 
   @Get('health') health() { return { status: 'ok', service: 'spectre-api' }; }
   @Get('health/supabase') supabaseHealth() { return this.supabase.checkConnection(); }
@@ -40,9 +41,22 @@ export class AppController {
     return this.auth.transferGuestData(userId, guestUserId, body.confirm === true);
   }
 
+  @Post('assistant/interpret') interpretAssistant(@Req() request: IdentityRequest, @Body() body: Record<string, any>) {
+    if (!request.identity) throw new UnauthorizedException('Open a guest workspace before using the assistant.');
+    const identityKey = request.identity.type === 'user' ? `user:${request.identity.id}` : `guest:${request.identity.deviceId}`;
+    return this.voice.interpret(body, identityKey);
+  }
+
   @Post('scheduled-actions') schedule(@Req() request: IdentityRequest, @Body() body: Record<string, any>) { return this.auth.createAction(this.requireUser(request), body); }
   @Get('scheduled-actions') scheduledActions(@Req() request: IdentityRequest) { return this.auth.listActions(this.requireUser(request)); }
   @Get('scheduled-actions/:id') scheduledAction(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.getAction(this.requireUser(request), id); }
+  @Post('scheduled-actions/:id/cancel') cancelScheduledAction(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.cancelAction(this.requireUser(request), id); }
+  @Post('scheduled-actions/:id/revoke-link') revokeScheduledActionLink(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.revokeGuestReminderAccess(this.requireUser(request), id); }
+  @Post('guest/reminders/view') guestReminder(@Body('token') token: string, @Req() request: IdentityRequest) { return this.auth.getGuestReminder(token, request.ip || 'unknown'); }
+  @Post('guest/reminders/acknowledge') acknowledgeGuestReminder(@Body('token') token: string, @Req() request: IdentityRequest) { return this.auth.acknowledgeGuestReminder(token, request.ip || 'unknown'); }
+  @Get('notifications') notifications(@Req() request: IdentityRequest) { return this.auth.listNotifications(this.requireUser(request)); }
+  @Patch('notifications/:id/read') markNotificationRead(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.markNotificationRead(this.requireUser(request), id); }
+  @Post('notifications/read-all') markAllNotificationsRead(@Req() request: IdentityRequest) { return this.auth.markAllNotificationsRead(this.requireUser(request)); }
 
   @Get('tasks') tasks(@Query() query: Record<string, string>) { return this.service.listTasks(query); }
   @Post('tasks') createTask(@Body() body: Record<string, any>) { return this.service.createTask(body); }
