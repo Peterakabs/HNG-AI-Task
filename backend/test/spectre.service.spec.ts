@@ -28,6 +28,14 @@ describe('SpectreService (unit)', () => {
     expect(await service.listTasks({ title: 'missing' })).toHaveLength(0);
   });
 
+  it('makes voice-created personal reminders idempotent for the same draft ID', async () => {
+    const assistantDraftId = randomUUID();
+    const first = await service.createTask(validTask({ assistantDraftId, title: 'Submit report' }));
+    const retry = await service.createTask(validTask({ assistantDraftId, title: 'Submit report' }));
+    expect(retry.id).toBe(first.id);
+    expect(await service.listTasks()).toHaveLength(1);
+  });
+
   it('initializes persistent owner state and keeps each scope separate', async () => {
     const guest = `guest:${randomUUID()}`;
     const first = await scopes.run(guest, () => service.getProfile());
