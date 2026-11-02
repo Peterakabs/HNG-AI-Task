@@ -490,18 +490,27 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
   const [error, setError] = useState('');
   const [muted, setMuted] = useState(false);
   const [recognitionAvailable, setRecognitionAvailable] = useState(false);
+  const [voiceSessionActive, setVoiceSessionActive] = useState(false);
   const recognitionRef = React.useRef(null);
-  const shouldInterpretRef = React.useRef(false);
+  const listeningSessionRef = React.useRef(false);
+  const voiceTurnPendingRef = React.useRef(false);
   const finalTranscriptRef = React.useRef('');
+  const voiceTurnTimerRef = React.useRef(null);
   const [manual, setManual] = useState(false);
   const [manualType, setManualType] = useState('personal_reminder');
 
   useEffect(() => { sessionStorage.setItem('spectre.voice-assistant-session', JSON.stringify({ messages: messages.slice(-30), draft })); }, [messages, draft]);
   useEffect(() => { setRecognitionAvailable(Boolean(window.SpeechRecognition || window.webkitSpeechRecognition)); }, []);
-  useEffect(() => () => { recognitionRef.current?.abort?.(); window.speechSynthesis?.cancel(); }, []);
+  useEffect(() => () => { listeningSessionRef.current = false; window.clearTimeout(voiceTurnTimerRef.current); recognitionRef.current?.abort?.(); window.speechSynthesis?.cancel(); }, []);
 
+  function resumeVoiceConversation() {
+    if (!listeningSessionRef.current || recognitionRef.current) return;
+    window.setTimeout(() => {
+      if (listeningSessionRef.current && !recognitionRef.current) startRecognition();
+    }, 250);
+  }
   function speak(text) {
-    if (muted || !window.speechSynthesis || !window.SpeechSynthesisUtterance) return;
+    if (muted || !window.speechSynthesis || !window.SpeechSynthesisUtterance) { resumeVoiceConversation(); return; }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     const language = (navigator.language || 'en').split('-')[0].toLowerCase();
@@ -512,8 +521,8 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
     utterance.rate = 0.96;
     utterance.pitch = 1;
     utterance.onstart = () => setPhase('speaking');
-    utterance.onend = () => setPhase('waiting');
-    utterance.onerror = () => setPhase('waiting');
+    utterance.onend = () => { setPhase('waiting'); resumeVoiceConversation(); };
+    utterance.onerror = () => { setPhase('waiting'); resumeVoiceConversation(); };
     window.speechSynthesis.speak(utterance);
   }
   function addAssistant(text) { setMessages((current) => [...current, { role: 'assistant', content: text }]); speak(text); }
@@ -531,18 +540,58 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
       setPhase(result.ready ? 'waiting' : 'waiting');
     } catch (err) { setError(err.message); setPhase('error'); addAssistant(`I couldn’t process that: ${err.message}`); }
   }
-  function startListening() {
+  function startRecognition() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) { setError('Voice recognition is not available in this browser. Type your request below.'); return; }
-    window.speechSynthesis?.cancel(); finalTranscriptRef.current = ''; shouldInterpretRef.current = true; setTranscript(''); setError(''); setPhase('listening');
-    const recognition = new SpeechRecognition(); recognitionRef.current = recognition; recognition.continuous = false; recognition.interimResults = true; recognition.lang = navigator.language || 'en-US';
-    recognition.onresult = (event) => { let finalText = ''; let interim = ''; for (let i = event.resultIndex; i < event.results.length; i += 1) { if (event.results[i].isFinal) finalText += event.results[i][0].transcript; else interim += event.results[i][0].transcript; } if (finalText) finalTranscriptRef.current += `${finalTranscriptRef.current ? ' ' : ''}${finalText}`; setTranscript(`${finalTranscriptRef.current}${interim ? `${finalTranscriptRef.current ? ' ' : ''}${interim}` : ''}`); };
-    recognition.onerror = (event) => { shouldInterpretRef.current = false; setPhase('error'); setError(event.error === 'not-allowed' ? 'Microphone permission was denied. You can type your request instead.' : `Voice input stopped (${event.error}). You can type your request instead.`); };
-    recognition.onend = () => { recognitionRef.current = null; const text = finalTranscriptRef.current.trim(); setPhase('idle'); if (shouldInterpretRef.current && text) { setTranscript(''); void interpret(text); } };
-    try { recognition.start(); } catch { setPhase('error'); setError('Could not start voice input. Type your request instead.'); }
+    if (!listeningSessionRef.current || recognitionRef.current) return;
+    finalTranscriptRef.current = '';
+    const recognition = new SpeechRecognition(); recognitionRef.current = recognition; recognition.continuous = true; recognition.interimResults = true; recognition.lang = navigator.language || 'en-US';
+    recognition.onresult = (event) => {
+      let finalText = ''; let interim = '';
+      for (let i = event.resultIndex; i < event.results.length; i += 1) { if (event.results[i].isFinal) finalText += event.results[i][0].transcript; else interim += event.results[i][0].transcript; }
+      if (finalText.trim()) {
+        finalTranscriptRef.current += `${finalTranscriptRef.current ? ' ' : ''}${finalText.trim()}`;
+        window.clearTimeout(voiceTurnTimerRef.current);
+        voiceTurnTimerRef.current = window.setTimeout(() => {
+          if (!listeningSessionRef.current || !finalTranscriptRef.current.trim()) return;
+          voiceTurnPendingRef.current = true;
+          recognitionRef.current?.stop();
+        }, 1250);
+      }
+      setTranscript(`${finalTranscriptRef.current}${interim ? `${finalTranscriptRef.current ? ' ' : ''}${interim}` : ''}`);
+    };
+    recognition.onerror = (event) => {
+      if (event.error === 'no-speech' || event.error === 'aborted') return;
+      listeningSessionRef.current = false; voiceTurnPendingRef.current = false; setVoiceSessionActive(false);
+      setPhase('error'); setError(event.error === 'not-allowed' ? 'Microphone permission was denied. You can type your request instead.' : `Voice input stopped (${event.error}). You can type your request instead.`);
+    };
+    recognition.onend = () => {
+      if (recognitionRef.current === recognition) recognitionRef.current = null;
+      if (voiceTurnPendingRef.current || listeningSessionRef.current && finalTranscriptRef.current.trim()) {
+        window.clearTimeout(voiceTurnTimerRef.current);
+        voiceTurnPendingRef.current = false;
+        const text = finalTranscriptRef.current.trim(); finalTranscriptRef.current = '';
+        setTranscript('');
+        if (text) void interpret(text);
+        else if (listeningSessionRef.current) resumeVoiceConversation();
+      } else if (listeningSessionRef.current) resumeVoiceConversation();
+      else setPhase('waiting');
+    };
+    try { recognition.start(); setPhase('listening'); }
+    catch { recognitionRef.current = null; listeningSessionRef.current = false; setPhase('error'); setError('Could not start voice input. Type your request instead.'); }
   }
-  function stopListening() { shouldInterpretRef.current = true; recognitionRef.current?.stop(); }
-  function interrupt() { shouldInterpretRef.current = false; recognitionRef.current?.abort?.(); recognitionRef.current = null; window.speechSynthesis?.cancel(); setPhase('waiting'); }
+  function startListening() {
+    window.speechSynthesis?.cancel(); listeningSessionRef.current = true; setVoiceSessionActive(true); voiceTurnPendingRef.current = false;
+    finalTranscriptRef.current = ''; setTranscript(''); setError(''); setPhase('listening'); startRecognition();
+  }
+  function stopListening() {
+    listeningSessionRef.current = false; setVoiceSessionActive(false); window.clearTimeout(voiceTurnTimerRef.current);
+    voiceTurnPendingRef.current = Boolean(finalTranscriptRef.current.trim());
+    if (recognitionRef.current) recognitionRef.current.stop();
+    else if (voiceTurnPendingRef.current) { const text = finalTranscriptRef.current.trim(); finalTranscriptRef.current = ''; voiceTurnPendingRef.current = false; setTranscript(''); void interpret(text); }
+    else setPhase('waiting');
+  }
+  function interrupt() { window.speechSynthesis?.cancel(); setPhase('waiting'); resumeVoiceConversation(); }
   async function execute(actionDraft) {
     if (actionDraft.actionType === 'schedule_email' && !authUser) { setPhase('waiting'); addAssistant('This reminder needs an account. Your draft is saved here. Sign in or create an account, then confirm it to schedule.'); onRequireAuth(); return; }
     setPhase('executing'); setError('');
@@ -553,6 +602,7 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
         await api('/scheduled-actions', { method: 'POST', body: { clientRequestId: actionDraft.draftId, taskId: null, recipientName: actionDraft.recipientName, recipientEmail: actionDraft.recipientEmail, subject: `Reminder: ${actionDraft.message.slice(0, 120)}`, message: actionDraft.message, scheduledAt: new Date(`${actionDraft.scheduledDate}T${actionDraft.scheduledTime}`).toISOString(), timezone: actionDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone, confirmed: true } });
       }
       setPhase('success'); setDraft(null); sessionStorage.removeItem('spectre.voice-assistant-session');
+      listeningSessionRef.current = false; setVoiceSessionActive(false); window.clearTimeout(voiceTurnTimerRef.current); recognitionRef.current?.abort?.(); recognitionRef.current = null;
       addAssistant(actionDraft.actionType === 'personal_reminder' ? 'Your personal reminder is set.' : `Your email reminder to ${actionDraft.recipientName} is scheduled.`);
       await onCompleted();
     } catch (err) { setError(err.message); setPhase('error'); addAssistant(`I couldn’t create the reminder: ${err.message}`); }
@@ -572,12 +622,12 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
   if (!open) return null;
   const ready = Boolean(draft && draft.scheduledDate && draft.scheduledTime && (draft.actionType === 'schedule_email' ? draft.recipientName && draft.recipientEmail && draft.message : draft.title || draft.message));
   return <Modal className="assistant-modal" title="Spectre Assistant" onClose={onClose}><div className="assistant-panel">
-    <div className="assistant-state" role="status"><span className={`assistant-state-dot ${phase}`} />{({ idle: 'Ready when you are', listening: 'Listening…', processing: 'Understanding your request…', speaking: 'Speaking…', waiting: 'Waiting for your response', executing: 'Creating reminder…', success: 'Reminder created', error: 'Needs attention' })[phase]}</div>
+    <div className="assistant-state" role="status"><span className={`assistant-state-dot ${phase}`} />{({ idle: 'Ready when you are', listening: 'Listening… say more anytime', processing: voiceSessionActive ? 'Understanding… I’ll keep listening' : 'Understanding your request…', speaking: 'Speaking…', waiting: voiceSessionActive ? 'Conversation open — say more anytime' : 'Waiting for your response', executing: 'Creating reminder…', success: 'Reminder created', error: 'Needs attention' })[phase]}</div>
     <div className="assistant-conversation" aria-live="polite">{messages.slice(-12).map((message, index) => <div className={`assistant-message ${message.role}`} key={`${index}-${message.content}`}><strong>{message.role === 'assistant' ? 'Spectre' : 'You'}</strong><p>{message.content}</p></div>)}</div>
     {draft && (manual || phase !== 'success') && <><div className="assistant-draft"><strong>{draft.actionType === 'schedule_email' ? 'Email reminder draft' : 'Personal reminder draft'}</strong><span>{draft.title || draft.message || 'Add reminder details'}</span><small>{draft.scheduledDate || 'Date needed'} {draft.scheduledTime || 'Time needed'} · {draft.timezone}</small>{draft.actionType === 'schedule_email' && <small>{draft.recipientName || 'Recipient needed'} · {draft.recipientEmail || 'Email needed'}</small>}</div>{manual && <form className="assistant-edit-form" onSubmit={saveManual}><label className="field">Reminder type<select name="actionType" value={manualType} onChange={(event) => setManualType(event.target.value)}><option value="personal_reminder">Personal reminder</option><option value="schedule_email">Email reminder</option></select></label>{manualType === 'schedule_email' && <><label className="field">Recipient name<TextInput name="recipientName" defaultValue={draft.recipientName || ''} /></label><label className="field">Recipient email<TextInput name="recipientEmail" type="email" defaultValue={draft.recipientEmail || ''} /></label></>}<label className="field">What should the reminder say?<TextInput name={manualType === 'personal_reminder' ? 'title' : 'message'} required defaultValue={manualType === 'personal_reminder' ? draft.title || draft.message || '' : draft.message || draft.title || ''} /></label><label className="field">Date<TextInput name="scheduledDate" type="date" required defaultValue={draft.scheduledDate || ''} /></label><label className="field">Time<TextInput name="scheduledTime" type="time" required defaultValue={draft.scheduledTime || ''} /></label><div className="modal-actions"><AppButton type="button" className="secondary-button" onClick={() => setManual(false)}>Back</AppButton><AppButton className="save-task">Save draft</AppButton></div></form>}</>}
     {error && <p className="assistant-error" role="alert">{error}</p>}
     {phase === 'success' && <div className="assistant-success-actions"><AppButton className="secondary-button" onClick={onShowScheduledActions}>View scheduled actions</AppButton><AppButton className="save-task" onClick={() => { setMessages([{ role: 'assistant', content: 'What would you like to remember next?' }]); setPhase('waiting'); setError(''); }}>Create another</AppButton></div>}
-    {phase !== 'success' && <><form className="assistant-input-row" onSubmit={(event) => { event.preventDefault(); const text = transcript.trim(); if (text) { setTranscript(''); void interpret(text); } }}><TextInput aria-label="Type a reminder request" placeholder="Say or type what you need to remember…" value={transcript} onChange={(event) => setTranscript(event.target.value)} /><AppButton className="save-task" loading={phase === 'processing'} disabled={!transcript.trim()}>{phase === 'processing' ? 'Thinking…' : 'Send'}</AppButton></form><div className="assistant-controls">{phase === 'listening' ? <AppButton className="assistant-icon-action iconbtn" aria-label="Stop listening" title="Stop listening" onClick={stopListening}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg></AppButton> : <AppButton className="assistant-icon-action iconbtn" aria-label="Speak now" title={recognitionAvailable ? 'Speak now' : 'Voice input unavailable'} disabled={!recognitionAvailable || phase === 'processing' || phase === 'executing'} onClick={startListening}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.8"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg></AppButton>}<AppButton className="assistant-icon-action iconbtn" aria-label="Replay last response" title="Replay response" disabled={!messages.some((message) => message.role === 'assistant') || phase === 'listening'} onClick={() => { const last = [...messages].reverse().find((message) => message.role === 'assistant'); if (last) speak(last.content); }}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="M17 9a5 5 0 0 1 0 6m2-9a9 9 0 0 1 0 12" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg></AppButton><AppButton className="assistant-icon-action iconbtn" aria-label={muted ? 'Enable spoken responses' : 'Mute spoken responses'} title={muted ? 'Unmute voice' : 'Mute voice'} onClick={() => setMuted((value) => { if (!value) { window.speechSynthesis?.cancel(); setPhase('waiting'); } return !value; })}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none">{muted ? <><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="m17 9 4 6m0-6-4 6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></> : <><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="M17 9a5 5 0 0 1 0 6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></>}</svg></AppButton>{phase === 'speaking' && <AppButton className="assistant-icon-action iconbtn" aria-label="Interrupt speech" title="Interrupt" onClick={interrupt}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg></AppButton>}{draft && ready && !manual && <AppButton className="save-task" loading={phase === 'executing'} onClick={confirmDraft}>{phase === 'executing' ? 'Creating…' : 'Confirm reminder'}</AppButton>}{draft && !manual && <AppButton className="secondary-button" onClick={() => { setManualType(draft.actionType); setManual(true); }}>Edit</AppButton>}{draft && <AppButton className="cancel-draft" onClick={cancelDraft}>Cancel</AppButton>}</div></>}
+    {phase !== 'success' && <><form className="assistant-input-row" onSubmit={(event) => { event.preventDefault(); const text = transcript.trim(); if (text) { if (voiceSessionActive) stopListening(); setTranscript(''); void interpret(text); } }}><TextInput aria-label="Type a reminder request" placeholder="Say or type what you need to remember…" value={transcript} onChange={(event) => setTranscript(event.target.value)} /><AppButton className="save-task" loading={phase === 'processing'} disabled={!transcript.trim()}>{phase === 'processing' ? 'Thinking…' : 'Send'}</AppButton></form><div className="assistant-controls">{voiceSessionActive ? <AppButton className="assistant-icon-action iconbtn" aria-label="Stop voice conversation" title="Stop conversation" onClick={stopListening}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg></AppButton> : <AppButton className="assistant-icon-action iconbtn" aria-label="Speak now" title={recognitionAvailable ? 'Speak now' : 'Voice input unavailable'} disabled={!recognitionAvailable || phase === 'processing' || phase === 'executing'} onClick={startListening}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.8"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg></AppButton>}<AppButton className="assistant-icon-action iconbtn" aria-label="Replay last response" title="Replay response" disabled={!messages.some((message) => message.role === 'assistant') || phase === 'listening'} onClick={() => { const last = [...messages].reverse().find((message) => message.role === 'assistant'); if (last) speak(last.content); }}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="M17 9a5 5 0 0 1 0 6m2-9a9 9 0 0 1 0 12" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg></AppButton><AppButton className="assistant-icon-action iconbtn" aria-label={muted ? 'Enable spoken responses' : 'Mute spoken responses'} title={muted ? 'Unmute voice' : 'Mute voice'} onClick={() => setMuted((value) => { if (!value) { window.speechSynthesis?.cancel(); setPhase('waiting'); } return !value; })}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none">{muted ? <><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="m17 9 4 6m0-6-4 6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></> : <><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="M17 9a5 5 0 0 1 0 6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></>}</svg></AppButton>{phase === 'speaking' && <AppButton className="assistant-icon-action iconbtn" aria-label="Interrupt speech" title="Interrupt" onClick={interrupt}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg></AppButton>}{draft && ready && !manual && <AppButton className="save-task" loading={phase === 'executing'} onClick={confirmDraft}>{phase === 'executing' ? 'Creating…' : 'Confirm reminder'}</AppButton>}{draft && !manual && <AppButton className="secondary-button" onClick={() => { setManualType(draft.actionType); setManual(true); }}>Edit</AppButton>}{draft && <AppButton className="cancel-draft" onClick={cancelDraft}>Cancel</AppButton>}</div></>}
   </div></Modal>;
 }
 
