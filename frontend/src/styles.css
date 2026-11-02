@@ -201,4 +201,21 @@ html,body,#root{max-width:100%;overflow-x:clip}
   .assistant-modal-backdrop{padding:0}.modal.assistant-modal{max-height:92dvh;padding:17px 15px max(14px,env(safe-area-inset-bottom));border-radius:24px 24px 0 0}.assistant-modal .modal-top{margin-bottom:10px}.assistant-modal .assistant-conversation{max-height:29dvh}.assistant-input-row{display:grid;grid-template-columns:minmax(0,1fr) 76px;gap:8px}.assistant-input-row>.app-input{grid-column:1/-1}.assistant-input-row>.save-task{grid-column:2;grid-row:2}.assistant-controls{display:flex;flex-wrap:wrap;gap:7px}.assistant-controls .assistant-icon-action{width:44px;height:44px}.assistant-controls>.save-task{flex:1 1 100%}.assistant-controls>.secondary-button,.assistant-controls>.cancel-draft{flex:1 1 auto}.assistant-edit-form{grid-template-columns:1fr}.assistant-edit-form>.field,.assistant-edit-form>.modal-actions{grid-column:1}
   .guest-reminder-page{padding:14px}.guest-reminder-card{border-radius:16px;padding:22px}.guest-reminder-brand{margin-bottom:32px}.guest-reminder-meta{gap:8px}
 }
+
+.filter-toggle{display:none}
+.sort-control{display:flex;align-items:center;gap:8px;font-weight:700}
+.sort-control select{min-width:150px}
+@media(max-width:1024px){
+  .toolbar{align-items:flex-start;flex-wrap:wrap}
+  .toolbar-actions{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:stretch;gap:8px;width:100%;min-width:0}
+  .toolbar-actions .search-input{grid-column:auto;width:100%;min-width:0;max-width:none;min-height:44px}
+  .filter-toggle{display:inline-flex;align-items:center;justify-content:center;min-width:96px;min-height:44px;padding:0 16px;border:1px solid var(--line);border-radius:12px;background:var(--paper);font-weight:700;white-space:nowrap}
+  .filters{display:none;margin:0 0 12px;padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--paper)}
+  .filters.filters-open{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .filters>*{width:100%;min-width:0;max-width:none;min-height:44px}
+  .filters .sort-control{grid-column:1/-1;justify-content:space-between;gap:12px}
+  .filters .sort-control select{width:min(62%,260px);min-height:44px}
+  .filters select{font-size:13px}
+  .filters .create-tag-btn{grid-column:1/-1}
+}
 @media(prefers-reduced-motion:reduce){.assistant-fab,.assistant-fab-label,.sidebar,.modal,.notes-drawer{transition:none}}
