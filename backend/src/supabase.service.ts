@@ -5,10 +5,16 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 export class SupabaseService implements OnModuleInit {
   private readonly logger = new Logger(SupabaseService.name);
   private client?: SupabaseClient;
-  private readonly url = process.env.SUPABASE_URL || 'https://lgseazfkoqaozavyozno.supabase.co';
-  private readonly key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  private readonly url = process.env.SUPABASE_URL?.trim() || 'https://lgseazfkoqaozavyozno.supabase.co';
+  private readonly key = process.env.SUPABASE_SECRET_KEY?.trim() || process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
   onModuleInit() {
+    // Log presence only: never print credential values to deployment logs.
+    this.logger.log(
+      `Environment check: SUPABASE_SECRET_KEY=${process.env.SUPABASE_SECRET_KEY?.trim() ? 'present' : 'missing'}, ` +
+      `SUPABASE_SERVICE_ROLE_KEY=${process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() ? 'present' : 'missing'}, ` +
+      `SUPABASE_URL=${process.env.SUPABASE_URL?.trim() ? 'present' : 'using default'}`,
+    );
     if (!this.key) return;
     this.client = createClient(this.url, this.key, {
       auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
