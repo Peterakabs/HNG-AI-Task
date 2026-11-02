@@ -481,10 +481,18 @@ const AppButton = ({ className = '', loading = false, children, ...props }) => <
 const TextInput = ({ className = '', ...props }) => <input className={`app-input ${className}`} {...props} />;
 
 function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, onShowScheduledActions }) {
+  const latestPropsRef = React.useRef({ authUser, onRequireAuth, onCompleted, onShowScheduledActions });
+  latestPropsRef.current = { authUser, onRequireAuth, onCompleted, onShowScheduledActions };
+  const openRef = React.useRef(open);
+  openRef.current = open;
   const restore = () => { try { return JSON.parse(sessionStorage.getItem('spectre.voice-assistant-session') || '{}'); } catch { return {}; } };
   const saved = useMemo(restore, []);
   const [messages, setMessages] = useState(Array.isArray(saved.messages) ? saved.messages : [{ role: 'assistant', content: 'Hi, I’m Spectre. Tell me what you’d like to remember, or ask me to email someone a reminder.' }]);
   const [draft, setDraft] = useState(saved.draft || null);
+  const messagesRef = React.useRef(messages);
+  const draftRef = React.useRef(draft);
+  messagesRef.current = messages;
+  draftRef.current = draft;
   const [transcript, setTranscript] = useState('');
   const [phase, setPhase] = useState('idle');
   const [error, setError] = useState('');
@@ -496,11 +504,24 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
   const voiceTurnPendingRef = React.useRef(false);
   const finalTranscriptRef = React.useRef('');
   const voiceTurnTimerRef = React.useRef(null);
+  const interpretationAbortRef = React.useRef(null);
+  const activeExecutionIdRef = React.useRef(null);
+  const cancelledExecutionIdsRef = React.useRef(new Set());
   const [manual, setManual] = useState(false);
   const [manualType, setManualType] = useState('personal_reminder');
 
   useEffect(() => { sessionStorage.setItem('spectre.voice-assistant-session', JSON.stringify({ messages: messages.slice(-30), draft })); }, [messages, draft]);
   useEffect(() => { setRecognitionAvailable(Boolean(window.SpeechRecognition || window.webkitSpeechRecognition)); }, []);
+  useEffect(() => {
+    if (open) return;
+    listeningSessionRef.current = false; voiceTurnPendingRef.current = false;
+    setVoiceSessionActive(false); setPhase('waiting'); window.clearTimeout(voiceTurnTimerRef.current);
+    recognitionRef.current?.abort?.(); recognitionRef.current = null;
+    finalTranscriptRef.current = ''; setTranscript('');
+    window.speechSynthesis?.cancel();
+    interpretationAbortRef.current?.abort(); interpretationAbortRef.current = null;
+    if (activeExecutionIdRef.current) cancelledExecutionIdsRef.current.add(activeExecutionIdRef.current);
+  }, [open]);
   useEffect(() => () => { listeningSessionRef.current = false; window.clearTimeout(voiceTurnTimerRef.current); recognitionRef.current?.abort?.(); window.speechSynthesis?.cancel(); }, []);
 
   function resumeVoiceConversation() {
@@ -525,20 +546,28 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
     utterance.onerror = () => { setPhase('waiting'); resumeVoiceConversation(); };
     window.speechSynthesis.speak(utterance);
   }
-  function addAssistant(text) { setMessages((current) => [...current, { role: 'assistant', content: text }]); speak(text); }
+  function addAssistant(text) {
+    const nextMessages = [...messagesRef.current, { role: 'assistant', content: text }];
+    messagesRef.current = nextMessages; setMessages(nextMessages); speak(text);
+  }
   async function interpret(text) {
-    const clean = text.trim(); if (!clean) return;
+    const clean = text.trim(); if (!clean || !openRef.current) return;
     setError(''); setManual(false); setPhase('processing');
-    const nextMessages = [...messages, { role: 'user', content: clean }];
-    setMessages(nextMessages);
+    const currentDraft = draftRef.current;
+    const nextMessages = [...messagesRef.current, { role: 'user', content: clean }];
+    messagesRef.current = nextMessages; setMessages(nextMessages);
+    const controller = new AbortController();
+    interpretationAbortRef.current?.abort(); interpretationAbortRef.current = controller;
     try {
-      const result = await api('/assistant/interpret', { method: 'POST', body: { transcript: clean, messages: nextMessages.slice(-8), currentDraft: draft, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone } });
-      setDraft(result.draft || null);
-      if (result.intent === 'cancel') { setDraft(null); addAssistant(result.assistantText); }
-      else if (result.intent === 'confirm' && result.ready && result.draft) { setDraft(result.draft); addAssistant(result.draft.actionType === 'schedule_email' && !authUser ? 'That email reminder needs an account. Sign in or create one, then confirm it to schedule.' : 'Confirmed. I’m creating your reminder now.'); await execute(result.draft); }
+      const result = await api('/assistant/interpret', { method: 'POST', signal: controller.signal, body: { transcript: clean, messages: nextMessages.slice(-8), currentDraft, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone } });
+      if (controller.signal.aborted || !openRef.current) return;
+      draftRef.current = result.draft || null; setDraft(draftRef.current);
+      if (result.intent === 'cancel') { draftRef.current = null; setDraft(null); addAssistant(result.assistantText); }
+      else if (result.intent === 'confirm' && result.ready && result.draft) { draftRef.current = result.draft; setDraft(result.draft); addAssistant(result.draft.actionType === 'schedule_email' && !latestPropsRef.current.authUser ? 'That email reminder needs an account. Sign in or create one, then confirm it to schedule.' : 'Confirmed. I’m creating your reminder now.'); await execute(result.draft); }
       else addAssistant(result.assistantText || 'What would you like me to change?');
       setPhase(result.ready ? 'waiting' : 'waiting');
-    } catch (err) { setError(err.message); setPhase('error'); addAssistant(`I couldn’t process that: ${err.message}`); }
+    } catch (err) { if (controller.signal.aborted || !openRef.current) return; setError(err.message); setPhase('error'); addAssistant(`I couldn’t process that: ${err.message}`); }
+    finally { if (interpretationAbortRef.current === controller) interpretationAbortRef.current = null; }
   }
   function startRecognition() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -593,29 +622,40 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
   }
   function interrupt() { window.speechSynthesis?.cancel(); setPhase('waiting'); resumeVoiceConversation(); }
   async function execute(actionDraft) {
-    if (actionDraft.actionType === 'schedule_email' && !authUser) { setPhase('waiting'); addAssistant('This reminder needs an account. Your draft is saved here. Sign in or create an account, then confirm it to schedule.'); onRequireAuth(); return; }
-    setPhase('executing'); setError('');
+    if (!openRef.current) return;
+    if (actionDraft.actionType === 'schedule_email' && !latestPropsRef.current.authUser) { setPhase('waiting'); addAssistant('This reminder needs an account. Your draft is saved here. Sign in or create an account, then confirm it to schedule.'); latestPropsRef.current.onRequireAuth(); return; }
+    setPhase('executing'); setError(''); activeExecutionIdRef.current = actionDraft.draftId;
     try {
+      let created;
       if (actionDraft.actionType === 'personal_reminder') {
-        await api('/tasks', { method: 'POST', body: { assistantDraftId: actionDraft.draftId, title: actionDraft.title || actionDraft.message, description: actionDraft.message || '', start: actionDraft.scheduledDate, due: new Date(`${actionDraft.scheduledDate}T${actionDraft.scheduledTime}`).toISOString(), status: 'To Do', priority: 'Medium', reminder: 'at-due', emailReminder: false, tags: [], subtasks: [], attachments: [], notes: '', folder: '', recurrence: '' } });
+        created = await api('/tasks', { method: 'POST', body: { assistantDraftId: actionDraft.draftId, title: actionDraft.title || actionDraft.message, description: actionDraft.message || '', start: actionDraft.scheduledDate, due: new Date(`${actionDraft.scheduledDate}T${actionDraft.scheduledTime}`).toISOString(), status: 'To Do', priority: 'Medium', reminder: 'at-due', emailReminder: false, tags: [], subtasks: [], attachments: [], notes: '', folder: '', recurrence: '' } });
       } else {
-        await api('/scheduled-actions', { method: 'POST', body: { clientRequestId: actionDraft.draftId, taskId: null, recipientName: actionDraft.recipientName, recipientEmail: actionDraft.recipientEmail, subject: `Reminder: ${actionDraft.message.slice(0, 120)}`, message: actionDraft.message, scheduledAt: new Date(`${actionDraft.scheduledDate}T${actionDraft.scheduledTime}`).toISOString(), timezone: actionDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone, confirmed: true } });
+        created = await api('/scheduled-actions', { method: 'POST', body: { clientRequestId: actionDraft.draftId, taskId: null, recipientName: actionDraft.recipientName, recipientEmail: actionDraft.recipientEmail, subject: `Reminder: ${actionDraft.message.slice(0, 120)}`, message: actionDraft.message, scheduledAt: new Date(`${actionDraft.scheduledDate}T${actionDraft.scheduledTime}`).toISOString(), timezone: actionDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone, confirmed: true } });
       }
-      setPhase('success'); setDraft(null); sessionStorage.removeItem('spectre.voice-assistant-session');
+      if (!openRef.current || cancelledExecutionIdsRef.current.has(actionDraft.draftId)) {
+        try {
+          if (actionDraft.actionType === 'personal_reminder' && created?.id) await api(`/tasks/${created.id}`, { method: 'DELETE' });
+          else if (actionDraft.actionType === 'schedule_email' && created?.id) await api(`/scheduled-actions/${created.id}/cancel`, { method: 'POST' });
+        } catch (cancelError) { console.error('[Spectre] Could not cancel the assistant action after its modal closed:', cancelError); }
+        cancelledExecutionIdsRef.current.delete(actionDraft.draftId);
+        return;
+      }
+      activeExecutionIdRef.current = null;
+      setPhase('success'); draftRef.current = null; setDraft(null); sessionStorage.removeItem('spectre.voice-assistant-session');
       listeningSessionRef.current = false; setVoiceSessionActive(false); window.clearTimeout(voiceTurnTimerRef.current); recognitionRef.current?.abort?.(); recognitionRef.current = null;
       addAssistant(actionDraft.actionType === 'personal_reminder' ? 'Your personal reminder is set.' : `Your email reminder to ${actionDraft.recipientName} is scheduled.`);
-      await onCompleted();
-    } catch (err) { setError(err.message); setPhase('error'); addAssistant(`I couldn’t create the reminder: ${err.message}`); }
+      await latestPropsRef.current.onCompleted();
+    } catch (err) { activeExecutionIdRef.current = null; if (!openRef.current || cancelledExecutionIdsRef.current.has(actionDraft.draftId)) { cancelledExecutionIdsRef.current.delete(actionDraft.draftId); return; } setError(err.message); setPhase('error'); addAssistant(`I couldn’t create the reminder: ${err.message}`); }
   }
   function confirmDraft() { if (draft) void execute(draft); }
-  function cancelDraft() { interrupt(); setDraft(null); setManual(false); setError(''); setPhase('waiting'); sessionStorage.removeItem('spectre.voice-assistant-session'); addAssistant('Okay, I cancelled this reminder draft. Nothing was created.'); }
+  function cancelDraft() { interrupt(); draftRef.current = null; setDraft(null); setManual(false); setError(''); setPhase('waiting'); sessionStorage.removeItem('spectre.voice-assistant-session'); addAssistant('Okay, I cancelled this reminder draft. Nothing was created.'); }
   function saveManual(event) {
     event.preventDefault(); const data = new FormData(event.currentTarget); const next = { draftId: draft?.draftId || crypto.randomUUID(), actionType: manualType, title: String(data.get('title') || '').trim(), message: String(data.get('message') || '').trim(), recipientName: String(data.get('recipientName') || '').trim(), recipientEmail: String(data.get('recipientEmail') || '').trim(), scheduledDate: String(data.get('scheduledDate') || ''), scheduledTime: String(data.get('scheduledTime') || ''), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
     if (next.actionType === 'personal_reminder') next.title ||= next.message;
     if (next.actionType === 'schedule_email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next.recipientEmail)) { setError('Enter a valid recipient email address.'); return; }
     if (!next.title && next.actionType === 'personal_reminder' || !next.message && next.actionType === 'schedule_email' || !next.scheduledDate || !next.scheduledTime || next.actionType === 'schedule_email' && !next.recipientName) { setError('Complete the required reminder details first.'); return; }
     if (new Date(`${next.scheduledDate}T${next.scheduledTime}`).getTime() <= Date.now()) { setError('Choose a future date and time.'); return; }
-    setDraft(next); setManual(false); setError(''); setPhase('waiting');
+    draftRef.current = next; setDraft(next); setManual(false); setError(''); setPhase('waiting');
     const summary = next.actionType === 'schedule_email' ? `I’ll email ${next.recipientName} at ${next.recipientEmail} on ${next.scheduledDate} at ${next.scheduledTime}: “${next.message}”. Please confirm to schedule it.` : `I’ll remind you on ${next.scheduledDate} at ${next.scheduledTime} to ${next.title}. Please confirm to create it.`;
     addAssistant(summary);
   }
@@ -626,7 +666,7 @@ function AssistantPanel({ open, onClose, authUser, onRequireAuth, onCompleted, o
     <div className="assistant-conversation" aria-live="polite">{messages.slice(-12).map((message, index) => <div className={`assistant-message ${message.role}`} key={`${index}-${message.content}`}><strong>{message.role === 'assistant' ? 'Spectre' : 'You'}</strong><p>{message.content}</p></div>)}</div>
     {draft && (manual || phase !== 'success') && <><div className="assistant-draft"><strong>{draft.actionType === 'schedule_email' ? 'Email reminder draft' : 'Personal reminder draft'}</strong><span>{draft.title || draft.message || 'Add reminder details'}</span><small>{draft.scheduledDate || 'Date needed'} {draft.scheduledTime || 'Time needed'} · {draft.timezone}</small>{draft.actionType === 'schedule_email' && <small>{draft.recipientName || 'Recipient needed'} · {draft.recipientEmail || 'Email needed'}</small>}</div>{manual && <form className="assistant-edit-form" onSubmit={saveManual}><label className="field">Reminder type<select name="actionType" value={manualType} onChange={(event) => setManualType(event.target.value)}><option value="personal_reminder">Personal reminder</option><option value="schedule_email">Email reminder</option></select></label>{manualType === 'schedule_email' && <><label className="field">Recipient name<TextInput name="recipientName" defaultValue={draft.recipientName || ''} /></label><label className="field">Recipient email<TextInput name="recipientEmail" type="email" defaultValue={draft.recipientEmail || ''} /></label></>}<label className="field">What should the reminder say?<TextInput name={manualType === 'personal_reminder' ? 'title' : 'message'} required defaultValue={manualType === 'personal_reminder' ? draft.title || draft.message || '' : draft.message || draft.title || ''} /></label><label className="field">Date<TextInput name="scheduledDate" type="date" required defaultValue={draft.scheduledDate || ''} /></label><label className="field">Time<TextInput name="scheduledTime" type="time" required defaultValue={draft.scheduledTime || ''} /></label><div className="modal-actions"><AppButton type="button" className="secondary-button" onClick={() => setManual(false)}>Back</AppButton><AppButton className="save-task">Save draft</AppButton></div></form>}</>}
     {error && <p className="assistant-error" role="alert">{error}</p>}
-    {phase === 'success' && <div className="assistant-success-actions"><AppButton className="secondary-button" onClick={onShowScheduledActions}>View scheduled actions</AppButton><AppButton className="save-task" onClick={() => { setMessages([{ role: 'assistant', content: 'What would you like to remember next?' }]); setPhase('waiting'); setError(''); }}>Create another</AppButton></div>}
+    {phase === 'success' && <div className="assistant-success-actions"><AppButton className="secondary-button" onClick={onShowScheduledActions}>View scheduled actions</AppButton><AppButton className="save-task" onClick={() => { const freshMessages = [{ role: 'assistant', content: 'What would you like to remember next?' }]; messagesRef.current = freshMessages; setMessages(freshMessages); setPhase('waiting'); setError(''); }}>Create another</AppButton></div>}
     {phase !== 'success' && <><form className="assistant-input-row" onSubmit={(event) => { event.preventDefault(); const text = transcript.trim(); if (text) { if (voiceSessionActive) stopListening(); setTranscript(''); void interpret(text); } }}><TextInput aria-label="Type a reminder request" placeholder="Say or type what you need to remember…" value={transcript} onChange={(event) => setTranscript(event.target.value)} /><AppButton className="save-task" loading={phase === 'processing'} disabled={!transcript.trim()}>{phase === 'processing' ? 'Thinking…' : 'Send'}</AppButton></form><div className="assistant-controls">{voiceSessionActive ? <AppButton className="assistant-icon-action iconbtn" aria-label="Stop voice conversation" title="Stop conversation" onClick={stopListening}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg></AppButton> : <AppButton className="assistant-icon-action iconbtn" aria-label="Speak now" title={recognitionAvailable ? 'Speak now' : 'Voice input unavailable'} disabled={!recognitionAvailable || phase === 'processing' || phase === 'executing'} onClick={startListening}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.8"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg></AppButton>}<AppButton className="assistant-icon-action iconbtn" aria-label="Replay last response" title="Replay response" disabled={!messages.some((message) => message.role === 'assistant') || phase === 'listening'} onClick={() => { const last = [...messages].reverse().find((message) => message.role === 'assistant'); if (last) speak(last.content); }}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="M17 9a5 5 0 0 1 0 6m2-9a9 9 0 0 1 0 12" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg></AppButton><AppButton className="assistant-icon-action iconbtn" aria-label={muted ? 'Enable spoken responses' : 'Mute spoken responses'} title={muted ? 'Unmute voice' : 'Mute voice'} onClick={() => setMuted((value) => { if (!value) { window.speechSynthesis?.cancel(); setPhase('waiting'); } return !value; })}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none">{muted ? <><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="m17 9 4 6m0-6-4 6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></> : <><path d="M4 10v4h4l5 4V6l-5 4H4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"/><path d="M17 9a5 5 0 0 1 0 6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></>}</svg></AppButton>{phase === 'speaking' && <AppButton className="assistant-icon-action iconbtn" aria-label="Interrupt speech" title="Interrupt" onClick={interrupt}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg></AppButton>}{draft && ready && !manual && <AppButton className="save-task" loading={phase === 'executing'} onClick={confirmDraft}>{phase === 'executing' ? 'Creating…' : 'Confirm reminder'}</AppButton>}{draft && !manual && <AppButton className="secondary-button" onClick={() => { setManualType(draft.actionType); setManual(true); }}>Edit</AppButton>}{draft && <AppButton className="cancel-draft" onClick={cancelDraft}>Cancel</AppButton>}</div></>}
   </div></Modal>;
 }
