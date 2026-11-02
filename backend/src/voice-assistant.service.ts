@@ -128,7 +128,12 @@ export class VoiceAssistantService {
     }
     const question = this.questionFor(readiness.missing, draft);
     const assistantText = question || this.summary(draft, readiness.scheduledAt!, timezone);
-    return { intent: readiness.missing.length ? 'clarification' : intent === 'correction' ? 'correction' : 'new_action', actionType, draft, ready: readiness.missing.length === 0, question, assistantText, scheduledAt: readiness.scheduledAt };
+    const responseIntent = readiness.missing.length
+      ? 'clarification'
+      : intent === 'confirm' && current
+        ? 'confirm'
+        : intent === 'correction' ? 'correction' : 'new_action';
+    return { intent: responseIntent, actionType, draft, ready: readiness.missing.length === 0, question, assistantText, scheduledAt: readiness.scheduledAt };
   }
 
   private getMissing(draft: AssistantDraft, timezone: string, localNow: string) {
