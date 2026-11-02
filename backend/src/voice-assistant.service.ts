@@ -49,7 +49,7 @@ export class VoiceAssistantService {
     };
     let response: Response;
     try {
-      const model = (process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash').replace(/^models\//, '');
+      const model = (process.env.GEMINI_MODEL?.trim() || 'gemini-3.8-flash').replace(/^models\//, '');
       response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
         method: 'POST', signal: AbortSignal.timeout(25_000),
         headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
