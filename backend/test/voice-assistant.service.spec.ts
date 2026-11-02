@@ -23,7 +23,7 @@ describe('VoiceAssistantService', () => {
       const result = await service.interpret({ transcript: 'Remind me tomorrow at 11:59 PM to submit my report.', timezone: 'Africa/Lagos', messages: [] }, 'guest:test');
       expect(result).toEqual(expect.objectContaining({ intent: 'new_action', actionType: 'personal_reminder', ready: true, draft: expect.objectContaining({ title: 'Submit report', scheduledTime: '23:59', timezone: 'Africa/Lagos' }) }));
       expect(result.scheduledAt).toBeTruthy();
-      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent'), expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ 'x-goog-api-key': 'test-secret' }) }));
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent'), expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ 'x-goog-api-key': 'test-secret' }) }));
       expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string).generationConfig.responseMimeType).toBe('application/json');
     } finally { fetchMock.mockRestore(); }
   });
