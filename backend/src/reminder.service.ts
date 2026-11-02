@@ -1,8 +1,9 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { AuthService } from './auth.service';
 
 @Injectable()
 export class ReminderService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(ReminderService.name);
   private timer?: NodeJS.Timeout;
   private running = false;
   constructor(private readonly auth: AuthService) {}
@@ -23,6 +24,8 @@ export class ReminderService implements OnModuleInit, OnModuleDestroy {
         try { await this.auth.sendEmail(action.recipientEmail, action.subject || `Reminder: ${action.message}`, body); await this.auth.finishAction(action.id); }
         catch (error) { await this.auth.finishAction(action.id, error instanceof Error ? error.message : 'Email delivery failed.'); }
       }
+    } catch (error) {
+      this.logger.error('Could not check due reminder actions.', error instanceof Error ? error.stack : String(error));
     } finally { this.running = false; }
   }
 }
