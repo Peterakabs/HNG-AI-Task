@@ -214,6 +214,15 @@ export class SpectreService {
     if (data.tags.some((tag) => tag.toLowerCase() === clean.toLowerCase())) throw new BadRequestException('Tag already exists.');
     data.tags.push(clean); await this.store.write(data); return { name: clean };
   }
+  async deleteTag(name: string) {
+    const clean = this.requireName(name, 'Tag');
+    const data = await this.store.read();
+    const existing = data.tags.find((tag) => tag.toLowerCase() === clean.toLowerCase());
+    if (!existing) throw new NotFoundException('Tag not found.');
+    data.tags = data.tags.filter((tag) => tag.toLowerCase() !== clean.toLowerCase());
+    data.tasks.forEach((task) => { task.tags = (task.tags || []).filter((tag) => tag.toLowerCase() !== existing.toLowerCase()); });
+    await this.store.write(data); return { name: existing };
+  }
 
   async listNotes() { return (await this.store.read()).notes.sort((a, b) => b.createdAt - a.createdAt); }
   async createNote(input: Record<string, any>) {

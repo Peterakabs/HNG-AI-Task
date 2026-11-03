@@ -89,6 +89,7 @@ export class AppController {
   @Delete('folders/:name') deleteFolder(@Param('name') name: string) { return this.service.deleteFolder(name); }
   @Get('tags') tags() { return this.service.listTags(); }
   @Post('tags') createTag(@Body('name') name: string) { return this.service.createTag(name); }
+  @Delete('tags/:name') deleteTag(@Param('name') name: string) { return this.service.deleteTag(name); }
 
   @Get('notes') notes() { return this.service.listNotes(); }
   @Post('notes') createNote(@Body() body: Record<string, any>) { return this.service.createNote(body); }
