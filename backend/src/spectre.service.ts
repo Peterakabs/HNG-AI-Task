@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { SupabaseStore, SpectreData } from './store';
 
 const priorities = ['High', 'Medium', 'Low'];
@@ -7,6 +7,98 @@ const statuses = ['To Do', 'Pending', 'Acknowledged', 'In Progress', 'Completed'
 @Injectable()
 export class SpectreService {
   constructor(private readonly store: SupabaseStore) {}
+
+  async listWeeklySummaries(timezone = 'Africa/Lagos') {
+    const zone = this.safeTimeZone(timezone);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const data = await this.store.read();
+      const summaries = data.weeklySummaries ?? (data.weeklySummaries = []);
+      let changed = false;
+      const now = new Date();
+      const currentWeek = this.weekStartKey(now, zone);
+      const previousWeek = this.shiftDateKey(currentWeek, -7);
+
+      // Give completed tasks created before this feature a full current week before archiving.
+      for (const task of data.tasks) {
+        if (task.status === 'Completed' && !task.completedAt) {
+          task.completedAt = now.toISOString();
+          changed = true;
+        }
+      }
+
+      const archiveByWeek = new Map<string, Record<string, any>[]>();
+      const archivedIds = new Set<string>();
+      for (const task of data.tasks) {
+        if (task.status !== 'Completed' || !task.completedAt) continue;
+        const weekStart = this.weekStartKey(new Date(task.completedAt), zone);
+        if (weekStart >= currentWeek) continue;
+        if (!archiveByWeek.has(weekStart)) archiveByWeek.set(weekStart, []);
+        archiveByWeek.get(weekStart)!.push({ ...task });
+        archivedIds.add(task.id);
+      }
+
+      const ensureSummary = (weekStart: string) => {
+        let summary = summaries.find((item) => item.weekStart === weekStart);
+        if (!summary) {
+          summary = { id: this.store.id(), weekStart, weekEnd: this.shiftDateKey(weekStart, 6), tasks: [], createdAt: now.toISOString(), viewedAt: null };
+          summaries.push(summary);
+          changed = true;
+        }
+        summary.tasks ??= [];
+        return summary;
+      };
+
+      for (const [weekStart, tasks] of archiveByWeek) {
+        const summary = ensureSummary(weekStart);
+        const existingIds = new Set(summary.tasks.map((task: Record<string, any>) => task.id));
+        for (const task of tasks) {
+          if (!existingIds.has(task.id)) {
+            summary.tasks.push(task);
+            changed = true;
+          }
+        }
+      }
+
+      // Create a report for every elapsed week, even when nothing was completed.
+      if (data.weeklySummaryThrough) {
+        let cursor = this.shiftDateKey(data.weeklySummaryThrough, 7);
+        while (cursor <= previousWeek) {
+          ensureSummary(cursor);
+          cursor = this.shiftDateKey(cursor, 7);
+        }
+      } else {
+        ensureSummary(previousWeek);
+        changed = true;
+      }
+      if (data.weeklySummaryThrough !== previousWeek) {
+        data.weeklySummaryThrough = previousWeek;
+        changed = true;
+      }
+      if (archivedIds.size) {
+        data.tasks = data.tasks.filter((task) => !archivedIds.has(task.id));
+        changed = true;
+      }
+
+      if (changed) {
+        try { await this.store.write(data); }
+        catch (error) { if (error instanceof ConflictException && attempt < 2) continue; throw error; }
+      }
+      return summaries.sort((a, b) => b.weekStart.localeCompare(a.weekStart));
+    }
+    throw new ConflictException('Weekly summaries changed in another request. Please retry.');
+  }
+
+  async markWeeklySummaryViewed(id: string) {
+    const data = await this.store.read();
+    const summaries = data.weeklySummaries ?? (data.weeklySummaries = []);
+    const summary = summaries.find((item) => item.id === id);
+    if (!summary) throw new NotFoundException('Weekly summary not found.');
+    if (!summary.viewedAt) {
+      summary.viewedAt = new Date().toISOString();
+      await this.store.write(data);
+    }
+    return summary;
+  }
 
   async listTasks(query: Record<string, string | undefined> = {}) {
     const data = await this.store.read();
@@ -40,7 +132,7 @@ export class SpectreService {
       folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: input.subtasks || [],
       attachments: input.attachments || [], notes: input.notes?.trim() || '',
       recurrence: input.recurrence || '', reminder: input.reminder || '', notified: false,
-      createdAt: Date.now(), order: data.tasks.length, ...(assistantDraftId ? { assistantDraftId } : {}),
+      createdAt: Date.now(), order: data.tasks.length, ...(input.status === 'Completed' ? { completedAt: new Date().toISOString() } : {}), ...(assistantDraftId ? { assistantDraftId } : {}),
     };
     data.tasks.push(task);
     this.recordTags(data, task.tags);
@@ -60,6 +152,8 @@ export class SpectreService {
       title: merged.title.trim(), description: merged.description?.trim() || '',
       tags: this.cleanTags(merged.tags), notified: merged.due === task.due ? task.notified : false,
     });
+    if (input.status === 'Completed' && !wasCompleted) task.completedAt = new Date().toISOString();
+    if (input.status && input.status !== 'Completed') delete task.completedAt;
     this.recordTags(data, task.tags);
     let recurringTask: Record<string, any> | undefined;
     if (input.status === 'Completed' && task.recurrence && !wasCompleted) {
@@ -153,6 +247,23 @@ export class SpectreService {
     if (!Array.isArray(value)) return [];
     return [...new Set(value.filter((tag): tag is string => typeof tag === 'string').map((tag) => tag.trim()).filter(Boolean))];
   }
+
+  private safeTimeZone(timezone: string) {
+    try { new Intl.DateTimeFormat('en', { timeZone: timezone }).format(); return timezone; }
+    catch { return 'Africa/Lagos'; }
+  }
+  private weekStartKey(value: Date, timezone: string) {
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(value);
+    const part = (type: string) => parts.find((item) => item.type === type)?.value || '0';
+    const localDate = new Date(Date.UTC(Number(part('year')), Number(part('month')) - 1, Number(part('day'))));
+    localDate.setUTCDate(localDate.getUTCDate() - ((localDate.getUTCDay() + 6) % 7));
+    return localDate.toISOString().slice(0, 10);
+  }
+  private shiftDateKey(value: string, days: number) {
+    const date = new Date(`${value}T12:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + days);
+    return date.toISOString().slice(0, 10);
+  }
   private recordTags(data: SpectreData, tags: string[]) {
     tags.forEach((tag) => { if (!data.tags.some((known) => known.toLowerCase() === tag.toLowerCase())) data.tags.push(tag); });
   }
@@ -173,6 +284,6 @@ export class SpectreService {
     else return undefined;
     const pad = (n: number) => String(n).padStart(2, '0');
     const due = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-    return { ...task, id: this.store.id(), due, status: 'To Do', createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false })) };
+    return { ...task, id: this.store.id(), due, status: 'To Do', completedAt: undefined, createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false })) };
   }
 }

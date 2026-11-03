@@ -126,6 +126,17 @@ export class AuthService {
     const foldersMerged = source.folders.filter((item) => !destination.folders.includes(item)).length;
     const tagsMerged = source.tags.filter((item) => !destination.tags.includes(item)).length;
     destination.tasks = [...destination.tasks, ...tasks]; destination.notes = [...destination.notes, ...notes];
+    const destinationSummaries = destination.weeklySummaries ?? (destination.weeklySummaries = []);
+    for (const sourceSummary of source.weeklySummaries || []) {
+      const existing = destinationSummaries.find((summary) => summary.weekStart === sourceSummary.weekStart);
+      if (!existing) destinationSummaries.push(sourceSummary);
+      else {
+        const knownTasks = new Set((existing.tasks || []).map((task: Record<string, any>) => task.id || taskFingerprint(task)));
+        existing.tasks = [...(existing.tasks || []), ...(sourceSummary.tasks || []).filter((task: Record<string, any>) => !knownTasks.has(task.id || taskFingerprint(task)))];
+        if (!existing.viewedAt) existing.viewedAt = sourceSummary.viewedAt || null;
+      }
+    }
+    if (source.weeklySummaryThrough && (!destination.weeklySummaryThrough || source.weeklySummaryThrough > destination.weeklySummaryThrough)) destination.weeklySummaryThrough = source.weeklySummaryThrough;
     destination.folders = [...new Set([...destination.folders, ...source.folders])];
     destination.tags = [...new Set([...destination.tags, ...source.tags])];
     await this.store.write(destination, `user:${userId}`);
