@@ -98,6 +98,19 @@ export class AuthService {
     return this.publicUser(data.user);
   }
 
+  async changePassword(userId: string, input: Record<string, any>) {
+    const currentPassword = this.cleanPassword(input.currentPassword, false);
+    const newPassword = this.cleanPassword(input.newPassword);
+    if (currentPassword === newPassword) throw new BadRequestException('Choose a password different from your current password.');
+    const { data: userData, error: userError } = await this.supabase.auth.admin.getUserById(userId);
+    if (userError || !userData.user?.email) throw new UnauthorizedException('Your session is no longer valid. Please log in again.');
+    const verified = await this.supabase.newClient().auth.signInWithPassword({ email: userData.user.email, password: currentPassword });
+    if (verified.error) throw new UnauthorizedException('Your current password is incorrect.');
+    const { error } = await this.supabase.auth.admin.updateUserById(userId, { password: newPassword });
+    if (error) throw new ServiceUnavailableException(`Could not update password: ${error.message}`);
+    return { status: 'ok' };
+  }
+
   async transferGuestData(userId: string, guestUserId: string, confirmed: boolean) {
     if (!confirmed) throw new BadRequestException('Confirm the guest data transfer before continuing.');
     if (!(await this.getUser(userId))) throw new UnauthorizedException('Authenticated account not found.');
@@ -354,7 +367,7 @@ export class AuthService {
     if (process.env.NODE_ENV === 'production' && !process.env.APP_URL?.trim()) missing.push('APP_URL');
     return missing;
   }
-  private publicUser(user: { id: string; email?: string; created_at?: string; updated_at?: string }) { return { id: user.id, email: user.email, createdAt: user.created_at ? Date.parse(user.created_at) : Date.now(), updatedAt: user.updated_at ? Date.parse(user.updated_at) : Date.now() }; }
+  private publicUser(user: { id: string; email?: string; created_at?: string; updated_at?: string; user_metadata?: Record<string, any> }) { return { id: user.id, email: user.email, avatarUrl: typeof user.user_metadata?.avatar_url === 'string' ? user.user_metadata.avatar_url : undefined, displayName: typeof user.user_metadata?.full_name === 'string' ? user.user_metadata.full_name : undefined, createdAt: user.created_at ? Date.parse(user.created_at) : Date.now(), updatedAt: user.updated_at ? Date.parse(user.updated_at) : Date.now() }; }
   private cleanEmail(value: unknown) { if (typeof value !== 'string' || value.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())) throw new BadRequestException('A valid email address is required.'); return value.trim().toLowerCase(); }
   private cleanPassword(value: unknown, enforce = true) { if (typeof value !== 'string' || (enforce && value.length < 8) || value.length > 256) throw new BadRequestException(enforce ? 'Password must be between 8 and 256 characters.' : 'Password is required.'); return value; }
   private required(value: unknown, label: string) { if (typeof value !== 'string' || !value.trim() || value.length > 2000) throw new BadRequestException(`${label} is required.`); return value.trim(); }
