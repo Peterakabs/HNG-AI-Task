@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query, Req, Res, UnauthorizedException } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Logger, Param, Patch, Post, Put, Query, Req, Res, UnauthorizedException } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { SpectreService } from './spectre.service';
 import { AuthService, RequestIdentity } from './auth.service';
@@ -10,6 +10,7 @@ type IdentityRequest = Request & { identity?: RequestIdentity };
 
 @Controller('api')
 export class AppController {
+  private readonly logger = new Logger(AppController.name);
   constructor(private readonly service: SpectreService, private readonly auth: AuthService, private readonly supabase: SupabaseService, private readonly voice: VoiceAssistantService, private readonly googleCalendar: GoogleCalendarService) {}
 
   @Get('health') health() { return { status: 'ok', service: 'spectre-api' }; }
@@ -107,6 +108,7 @@ export class AppController {
       response.cookie('spectre_google_calendar_oauth_state', nonce, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/api/google-calendar/oauth', maxAge: 10 * 60 * 1000 });
       return response.redirect(302, authorizationUrl);
     } catch (error) {
+      this.logger.warn(`Google Calendar OAuth start failed: ${this.safeErrorMessage(error)}`);
       return response.redirect(302, this.googleCalendar.callbackUrl('error', this.oauthErrorReason(error)));
     }
   }
@@ -122,6 +124,7 @@ export class AppController {
       response.clearCookie('spectre_google_calendar_oauth_state', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/api/google-calendar/oauth' });
       return response.redirect(303, this.googleCalendar.callbackUrl('connected'));
     } catch (error) {
+      this.logger.warn(`Google Calendar OAuth callback failed: ${this.safeErrorMessage(error)}`);
       response.clearCookie('spectre_google_calendar_oauth_state', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/api/google-calendar/oauth' });
       return response.redirect(303, this.googleCalendar.callbackUrl('error', this.oauthErrorReason(error)));
     }
@@ -137,7 +140,15 @@ export class AppController {
     const message = error instanceof Error ? error.message : '';
     if (/not configured|must be an absolute|must use HTTPS/i.test(message)) return 'setup';
     if (/permission was declined/i.test(message)) return 'denied';
+    if (/authorization expired|could not be verified|belongs to another account/i.test(message)) return 'state';
+    if (/google could not complete|offline calendar access|verified account email/i.test(message)) return 'google';
+    if (/token encryption|could not be decrypted/i.test(message)) return 'encryption';
+    if (/could not save google calendar/i.test(message)) return 'database';
     return 'failed';
+  }
+  private safeErrorMessage(error: unknown) {
+    // Log only the exception message, never OAuth codes, cookies, request headers, or tokens.
+    return error instanceof Error ? error.message : 'Unknown error';
   }
   private setSession(response: Response, session: string) { response.cookie('spectre_session', session, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 24 * 60 * 60 * 1000 }); }
 }
