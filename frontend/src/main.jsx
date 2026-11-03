@@ -294,6 +294,14 @@ function App() {
         ? 'Google Calendar OAuth is not configured on the backend. Check the Google OAuth client ID, client secret, redirect URL, and token encryption key in Render.'
         : reason === 'denied'
           ? 'Google Calendar access was not approved. Try again and allow access to view your calendar events.'
+          : reason === 'state'
+            ? 'The Google Calendar sign-in expired or could not be verified. Start the connection again from Spectre.'
+            : reason === 'google'
+              ? 'Google did not complete Calendar authorization. Check the OAuth client redirect URL and Calendar permission, then try again.'
+              : reason === 'encryption'
+                ? 'The backend could not encrypt the Google connection. Check that GOOGLE_TOKEN_ENCRYPTION_KEY is set as a Render environment variable to exactly 64 hexadecimal characters.'
+                : reason === 'database'
+                  ? 'Google authorization succeeded, but Spectre could not save the connection. Check the Supabase Google Calendar table and backend logs.'
           : 'Google Calendar could not be connected. Please try again and approve the requested Calendar permission.';
       showFeedback('error', message, reason === 'setup' ? 'Google Calendar setup required' : 'Google Calendar connection failed');
     }
