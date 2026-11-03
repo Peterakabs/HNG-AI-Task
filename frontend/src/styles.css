@@ -325,3 +325,29 @@ html[data-theme="dark"] .delete-series-button{background:#392624;color:#ffb6a9;b
   .note-editor-actions>.app-button{width:100%}
 }
 @media(max-width:380px){.center{padding-left:11px;padding-right:11px}.top-actions{gap:4px}.profile-overview{gap:12px}.profile-avatar{width:54px;height:54px}}
+
+/* Google OAuth, Calendar, and conflict confirmation */
+.google-auth-button{width:100%;min-height:46px;display:flex;align-items:center;justify-content:center;gap:10px;background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:11px;font-weight:650}
+.google-mark{width:19px;height:19px;flex:none}
+.google-auth-hint{display:block;margin:8px 0;color:var(--muted);font-size:12px}
+.auth-divider{display:flex;align-items:center;gap:12px;margin:16px 0;color:var(--muted);font-size:12px}
+.auth-divider:before,.auth-divider:after{content:"";height:1px;background:var(--line);flex:1}
+.google-calendar-card{display:flex;align-items:center;justify-content:space-between;gap:22px;flex-wrap:wrap}
+.google-calendar-card h2{margin:0 0 6px}
+.google-calendar-card p{margin:0;color:var(--muted);max-width:620px}
+.google-calendar-card small{display:block;margin-top:6px;color:var(--muted)}
+.google-calendar-card .app-button{display:inline-flex;align-items:center;justify-content:center;gap:9px}
+.google-calendar-legend{display:flex;align-items:center;gap:8px;margin:-7px 0 10px;color:var(--muted);font-size:12px}
+.google-calendar-legend>span,.google-event-dot{width:9px;height:9px;flex:none;border-radius:50%;background:#34a853}
+.cal-google-event{position:relative;display:flex;justify-content:space-between;gap:3px;width:100%;min-width:0;overflow:hidden;border:0;border-radius:4px;background:#e5f4e9;color:#24733a;padding:3px 4px;white-space:nowrap;text-align:left;text-overflow:ellipsis;font-size:9px;cursor:pointer}
+.cal-google-event:hover{overflow:visible;z-index:2}
+.cal-google-event .hover-date{display:none;flex:none;background:#202433;color:#fff;border-radius:4px;padding:3px 5px;font-size:9px;box-shadow:0 4px 14px #0002}
+.cal-google-event:hover .hover-date{display:block}
+.google-event-agenda{display:flex;align-items:center;gap:12px;padding:14px 16px;border:1px solid var(--line);border-left:3px solid #34a853;border-radius:10px;background:var(--paper);color:var(--ink);text-decoration:none}
+.google-event-agenda>span:nth-child(2){display:grid;gap:4px;min-width:0;flex:1}
+.google-event-agenda small{color:var(--muted)}
+.calendar-conflict-list{display:grid;gap:8px;margin:14px 0 20px}
+.calendar-conflict-item{display:grid;gap:4px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+.calendar-conflict-item span{font-size:13px;color:var(--muted)}
+html[data-theme="dark"] .cal-google-event{background:#183625;color:#ace5b6}
+@media(max-width:680px){.google-calendar-card{align-items:flex-start;flex-direction:column}.google-calendar-card>.app-button{width:100%}.google-auth-button{min-height:48px}}

@@ -4,12 +4,13 @@ import { SpectreService } from './spectre.service';
 import { AuthService, RequestIdentity } from './auth.service';
 import { SupabaseService } from './supabase.service';
 import { VoiceAssistantService } from './voice-assistant.service';
+import { GoogleCalendarService } from './google-calendar.service';
 
 type IdentityRequest = Request & { identity?: RequestIdentity };
 
 @Controller('api')
 export class AppController {
-  constructor(private readonly service: SpectreService, private readonly auth: AuthService, private readonly supabase: SupabaseService, private readonly voice: VoiceAssistantService) {}
+  constructor(private readonly service: SpectreService, private readonly auth: AuthService, private readonly supabase: SupabaseService, private readonly voice: VoiceAssistantService, private readonly googleCalendar: GoogleCalendarService) {}
 
   @Get('health') health() { return { status: 'ok', service: 'spectre-api' }; }
   @Get('health/supabase') supabaseHealth() { return this.supabase.checkConnection(); }
@@ -23,6 +24,17 @@ export class AppController {
   }
   @Post('auth/logout') async logout(@Req() request: IdentityRequest, @Res({ passthrough: true }) response: Response) { await this.auth.logout(request.headers.cookie); response.clearCookie('spectre_session', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', path: '/' }); return { status: 'ok' }; }
   @Get('auth/me') me(@Req() request: IdentityRequest) { return request.identity?.type === 'user' ? this.auth.getUser(request.identity.id) : null; }
+  @Post('auth/google/session') async googleSession(@Body() body: Record<string, any>, @Req() request: IdentityRequest, @Res({ passthrough: true }) response: Response) {
+    const result = await this.auth.exchangeGoogleSession(body);
+    if (request.identity?.type === 'user' && request.identity.id !== result.user.id) throw new UnauthorizedException('Google returned a different account than the one currently signed in.');
+    this.setSession(response, result.session); return result.user;
+  }
+  @Get('auth/google/link-session') async googleLinkSession(@Req() request: IdentityRequest, @Res({ passthrough: true }) response: Response) {
+    this.requireUser(request);
+    const result = await this.auth.googleLinkSession(request.headers.cookie);
+    if (result.session) this.setSession(response, this.auth.encodeSession(result.session));
+    return result;
+  }
   @Post('auth/guest') async guestAccount(@Req() request: IdentityRequest, @Res({ passthrough: true }) response: Response) {
     if (request.identity?.type !== 'guest') throw new UnauthorizedException('Authenticated users do not need a guest account.');
     const account = request.identity.guestUserId
@@ -86,6 +98,12 @@ export class AppController {
   @Get('profile') profile() { return this.service.getProfile(); }
   @Put('profile') updateProfile(@Body() body: Record<string, any>) { return this.service.updateProfile(body); }
   @Put('auth/password') updatePassword(@Req() request: IdentityRequest, @Body() body: Record<string, any>) { return this.auth.changePassword(this.requireUser(request), body); }
+
+  @Get('google-calendar/status') googleCalendarStatus(@Req() request: IdentityRequest) { return this.googleCalendar.status(this.requireUser(request)); }
+  @Get('google-calendar/events') googleCalendarEvents(@Req() request: IdentityRequest, @Query('timeMin') timeMin: string, @Query('timeMax') timeMax: string) { return this.googleCalendar.events(this.requireUser(request), timeMin, timeMax); }
+  @Get('google-calendar/conflicts') googleCalendarConflicts(@Req() request: IdentityRequest, @Query('due') due: string, @Query('localDate') localDate?: string) { return this.googleCalendar.conflicts(this.requireUser(request), due, localDate); }
+  @Post('google-calendar/connect') connectGoogleCalendar(@Req() request: IdentityRequest, @Body() body: Record<string, unknown>) { return this.googleCalendar.connect(this.requireUser(request), body); }
+  @Delete('google-calendar/connect') disconnectGoogleCalendar(@Req() request: IdentityRequest) { return this.googleCalendar.disconnect(this.requireUser(request)); }
 
   private requireUser(request: IdentityRequest) { if (request.identity?.type !== 'user') throw new UnauthorizedException('Sign in to use scheduled actions.'); return request.identity.id; }
   private setSession(response: Response, session: string) { response.cookie('spectre_session', session, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 24 * 60 * 60 * 1000 }); }

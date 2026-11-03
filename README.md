@@ -58,6 +58,27 @@ pnpm test:integration
 pnpm build
 ```
 
+## Playwright browser tests
+
+Install the browser once after installing workspace dependencies:
+
+```powershell
+pnpm install
+pnpm exec playwright install chromium
+```
+
+Run the frontend in one PowerShell window, then run the browser tests in a second:
+
+```powershell
+# Window 1
+pnpm --filter @spectre/web dev --host 127.0.0.1
+
+# Window 2
+pnpm test:e2e
+```
+
+These tests mock the API and simulate voice recognition, so they do not require Supabase credentials, a Gemini key, email delivery, or microphone permission. They cover task create/edit/delete/complete and search, folders and tags, notes and username changes, calendar task creation, signup/login/session persistence/sign-out, scheduling an email reminder, and the voice assistant confirmation/cancellation flows. The mock-backed browser tests verify frontend behavior; run the API unit and integration suites separately to exercise the backend and database layer.
+
 ## API overview
 
 - `GET /api/health`

@@ -8,6 +8,10 @@
     "build": "pnpm --filter @spectre/api build && pnpm --filter @spectre/web build",
     "test": "pnpm --filter @spectre/api test",
     "test:unit": "pnpm --filter @spectre/api test:unit",
-    "test:integration": "pnpm --filter @spectre/api test:integration"
+    "test:integration": "pnpm --filter @spectre/api test:integration",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1"
   }
 }

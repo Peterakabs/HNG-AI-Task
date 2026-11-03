@@ -83,6 +83,27 @@ export class AuthService {
     return { user: this.publicUser(data.user), session: this.encodeSession(data.session) };
   }
 
+  async exchangeGoogleSession(input: Record<string, any>) {
+    const accessToken = typeof input.accessToken === 'string' ? input.accessToken : '';
+    const refreshToken = typeof input.refreshToken === 'string' ? input.refreshToken : '';
+    if (!accessToken || !refreshToken || accessToken.length > 8192 || refreshToken.length > 4096) throw new UnauthorizedException('Google sign-in did not return a valid session. Please try again.');
+    const { data, error } = await this.supabase.auth.getUser(accessToken);
+    if (error || !data.user) throw new UnauthorizedException('Google sign-in session could not be verified. Please try again.');
+    const googleIdentity = data.user.app_metadata?.provider === 'google' || (Array.isArray(data.user.identities) && data.user.identities.some((identity: any) => identity.provider === 'google'));
+    if (!googleIdentity) throw new UnauthorizedException('This sign-in session is not connected to Google.');
+    return { user: this.publicUser(data.user), session: this.encodeSession({ access_token: accessToken, refresh_token: refreshToken }) };
+  }
+
+  async googleLinkSession(cookieHeader?: string) {
+    const result = await this.identityFromCookie(cookieHeader);
+    if (!result || result.identity.type !== 'user') throw new UnauthorizedException('Sign in before connecting Google Calendar.');
+    const current = this.readCookie(cookieHeader, 'spectre_session');
+    if (!current) throw new UnauthorizedException('Your session expired. Please log in again.');
+    const stored = JSON.parse(Buffer.from(decodeURIComponent(current), 'base64url').toString('utf8')) as SessionCookie;
+    const refreshed = result.session ? JSON.parse(Buffer.from(result.session, 'base64url').toString('utf8')) as SessionCookie : undefined;
+    return { user: await this.getUser(result.identity.id), session: refreshed || stored };
+  }
+
   async logout(cookieHeader?: string) {
     const raw = this.readCookie(cookieHeader, 'spectre_session');
     if (!raw) return;
