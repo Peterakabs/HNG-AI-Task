@@ -4,4 +4,9 @@ dist/
 coverage/
 .data/
 .jest-cache/
+test-results/
+playwright-report/
+.corepack/
+.pnpm-store/
+.playwright-runtime/
 .env
