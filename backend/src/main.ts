@@ -2,13 +2,16 @@ import 'reflect-metadata';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { NestFactory } from '@nestjs/core';
+import { json, urlencoded } from 'express';
 import { AppModule } from './app.module';
 
 const backendEnv = resolve(__dirname, '../.env');
 if (existsSync(backendEnv)) process.loadEnvFile(backendEnv);
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
+  app.use(json({ limit: '1mb' }));
+  app.use(urlencoded({ extended: true, limit: '1mb' }));
   app.getHttpAdapter().getInstance().set('trust proxy', 1);
   app.enableCors({ origin: process.env.WEB_ORIGIN || 'http://localhost:5173', credentials: true });
   app.setGlobalPrefix('');

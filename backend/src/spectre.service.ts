@@ -240,8 +240,8 @@ export class SpectreService {
   async updateProfile(input: Record<string, any>) {
     const username = this.requireName(input.username, 'Username');
     const phone = typeof input.phone === 'string' ? input.phone.trim().slice(0, 40) : undefined;
-    const avatarUrl = typeof input.avatarUrl === 'string' ? input.avatarUrl.trim().slice(0, 2000) : undefined;
-    if (avatarUrl && !/^https:\/\//i.test(avatarUrl)) throw new BadRequestException('Profile image URL must use HTTPS.');
+    const avatarUrl = typeof input.avatarUrl === 'string' ? input.avatarUrl.trim().slice(0, 800_000) : undefined;
+    if (avatarUrl && !/^https:\/\//i.test(avatarUrl) && !/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(avatarUrl)) throw new BadRequestException('Choose a valid HTTPS image or upload a JPG, PNG, or WebP image.');
     const data = await this.store.read(); data.username = username; if (phone !== undefined) data.phone = phone; if (avatarUrl !== undefined) data.avatarUrl = avatarUrl; await this.store.write(data); return { username, ...(data.phone ? { phone: data.phone } : {}), ...(data.avatarUrl ? { avatarUrl: data.avatarUrl } : {}) };
   }
 

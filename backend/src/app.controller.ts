@@ -46,6 +46,11 @@ export class AppController {
     const identityKey = request.identity.type === 'user' ? `user:${request.identity.id}` : `guest:${request.identity.deviceId}`;
     return this.voice.interpret(body, identityKey);
   }
+  @Post('assistant/notes/rewrite') rewriteNote(@Req() request: IdentityRequest, @Body() body: Record<string, any>) {
+    if (!request.identity) throw new UnauthorizedException('Open a guest workspace before using the note assistant.');
+    const identityKey = request.identity.type === 'user' ? 'user:' + request.identity.id : 'guest:' + request.identity.deviceId;
+    return this.voice.rewriteNotes(body, identityKey);
+  }
 
   @Post('scheduled-actions') schedule(@Req() request: IdentityRequest, @Body() body: Record<string, any>) { return this.auth.createAction(this.requireUser(request), body); }
   @Get('scheduled-actions') scheduledActions(@Req() request: IdentityRequest) { return this.auth.listActions(this.requireUser(request)); }
