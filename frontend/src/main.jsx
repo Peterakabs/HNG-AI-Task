@@ -216,6 +216,7 @@ function App() {
   const [modal, setModal] = useState(null);
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [feedback, setFeedback] = useState({ kind: 'success', title: '', message: '' });
+  const [confirmation, setConfirmation] = useState(null);
   const [dueAlert, setDueAlert] = useState(null);
   const [taskDraft, setTaskDraft] = useState(null);
   const [editingId, setEditingId] = useState(null);
@@ -502,7 +503,12 @@ function App() {
       sessionStorage.setItem('spectre.google.intent', 'calendar');
       const { error } = await client.auth.linkIdentity({ provider: 'google', options: { redirectTo: window.location.origin, scopes: 'https://www.googleapis.com/auth/calendar.events.readonly', queryParams: { access_type: 'offline', prompt: 'consent' } } });
       if (error) throw error;
-    } catch (err) { sessionStorage.removeItem('spectre.google.intent'); showFeedback('error', err.message); }
+    } catch (err) {
+      sessionStorage.removeItem('spectre.google.intent');
+      if (err.code === 'manual_linking_disabled' || /manual linking is disabled/i.test(err.message || '')) {
+        showFeedback('error', 'Supabase has manual identity linking turned off. In Supabase Dashboard, open Authentication → Settings, enable “Allow manual linking,” save, then try connecting Google Calendar again.', 'Google Calendar setup required');
+      } else showFeedback('error', err.message);
+    }
     finally { setBusyAction(''); }
   }
   async function disconnectGoogleCalendar() {
@@ -605,10 +611,19 @@ function App() {
     catch (err) { showFeedback('error', err.message); }
     finally { toggleRequests.current.delete(task.id); setBusyAction(''); }
   }
+  function requestConfirmation(options) {
+    setConfirmation(options);
+    setModal('confirmation');
+  }
+  async function confirmRequestedAction() {
+    const action = confirmation?.onConfirm;
+    setConfirmation(null);
+    setModal(null);
+    if (action) await action();
+  }
   async function deleteTask(task) {
     if (task.recurrence && task.recurrenceId) { setDeleteTarget(task); setModal('delete-recurring'); return; }
-    if (!window.confirm(`Delete “${task.title}”?`)) return;
-    await performDeleteTask(task, false);
+    requestConfirmation({ title: 'Delete task?', message: `Delete “${task.title}”? This can’t be undone.`, confirmLabel: 'Delete task', onConfirm: () => performDeleteTask(task, false) });
   }
   async function performDeleteTask(task, series) {
     setBusyAction(`delete-${task.id}`);
@@ -640,23 +655,25 @@ function App() {
     finally { setBusyAction(''); }
   }
   async function removeFolder(folder) {
-    if (!window.confirm(`Delete folder “${folder}”? Tasks will stay, without a folder.`)) return;
-    setBusyAction(`delete-folder-${folder}`);
-    try { await api(`/folders/${encodeURIComponent(folder)}`, { method: 'DELETE' }); await reload(); if (selectedFolder === folder) changeView('all'); showFeedback('success', 'Folder deleted.'); }
-    catch (err) { showFeedback('error', err.message); }
-    finally { setBusyAction(''); }
+    requestConfirmation({ title: 'Delete folder?', message: `Delete “${folder}”? Tasks in this folder will stay in your task list.`, confirmLabel: 'Delete folder', onConfirm: async () => {
+      setBusyAction(`delete-folder-${folder}`);
+      try { await api(`/folders/${encodeURIComponent(folder)}`, { method: 'DELETE' }); await reload(); if (selectedFolder === folder) changeView('all'); showFeedback('success', 'Folder deleted.'); }
+      catch (err) { showFeedback('error', err.message); }
+      finally { setBusyAction(''); }
+    } });
   }
   async function removeTag(tag) {
-    if (!window.confirm(`Delete the “${tag}” tag? It will also be removed from tasks that use it.`)) return;
-    setBusyAction(`delete-tag-${tag}`);
-    try {
-      await api(`/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
-      if (selectedTag === tag) changeView('all');
-      setFilters((current) => current.tag === tag ? { ...current, tag: '' } : current);
-      await reload();
-      showFeedback('success', 'Tag deleted.');
-    } catch (err) { showFeedback('error', err.message); }
-    finally { setBusyAction(''); }
+    requestConfirmation({ title: 'Delete tag?', message: `Delete “${tag}”? It will also be removed from tasks that use it.`, confirmLabel: 'Delete tag', onConfirm: async () => {
+      setBusyAction(`delete-tag-${tag}`);
+      try {
+        await api(`/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
+        if (selectedTag === tag) changeView('all');
+        setFilters((current) => current.tag === tag ? { ...current, tag: '' } : current);
+        await reload();
+        showFeedback('success', 'Tag deleted.');
+      } catch (err) { showFeedback('error', err.message); }
+      finally { setBusyAction(''); }
+    } });
   }
   async function addNote(event) {
     event.preventDefault();
@@ -760,6 +777,7 @@ function App() {
       <div className="form-grid"><label className="field">Start date *<TextInput type="date" required value={taskDraft.start} onChange={(event) => setTaskDraft({ ...taskDraft, start: event.target.value })} /></label><label className="field">Due date & time *<TextInput type="datetime-local" required value={taskDraft.due} onChange={(event) => setTaskDraft({ ...taskDraft, due: event.target.value })} /></label><label className="field">Status *<select value={taskDraft.status} onChange={(event) => setTaskDraft({ ...taskDraft, status: event.target.value })}>{['To Do', 'In Progress', 'Completed'].map((item) => <option key={item}>{item}</option>)}</select></label><label className="field">Priority *<select value={taskDraft.priority} onChange={(event) => setTaskDraft({ ...taskDraft, priority: event.target.value })}>{['High', 'Medium', 'Low'].map((item) => <option key={item}>{item}</option>)}</select></label></div>
       <details className="optional-details" open={Boolean(editingId && (taskDraft.description || taskDraft.folder || taskDraft.tags || taskDraft.notes))}><summary>＋ Optional details</summary><div className="form-grid"><label className="field full">Description<textarea rows="3" value={taskDraft.description || ''} onChange={(event) => setTaskDraft({ ...taskDraft, description: event.target.value })} /></label><label className="field">Folder<select value={taskDraft.folder || ''} onChange={(event) => setTaskDraft({ ...taskDraft, folder: event.target.value })}><option value="">No folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select></label><label className="field">Tags, separated by commas<TextInput value={taskDraft.tags} onChange={(event) => setTaskDraft({ ...taskDraft, tags: event.target.value })} /></label><label className="field">Repeat<select value={taskDraft.recurrence || ''} onChange={(event) => setTaskDraft({ ...taskDraft, recurrence: event.target.value })}><option value="">Does not repeat</option>{['Daily', 'Weekly', 'Monthly'].map((item) => <option key={item}>{item}</option>)}</select></label><label className="field">In-app reminder<select value={taskDraft.reminder || ''} onChange={(event) => setTaskDraft({ ...taskDraft, reminder: event.target.value })}><option value="">No reminder</option><option value="at-due">At due time</option><option value="10">10 minutes before</option><option value="60">1 hour before</option><option value="1440">1 day before</option></select></label><label className="field full reminder-check"><TextInput type="checkbox" checked={Boolean(taskDraft.emailReminder)} onChange={(event) => setTaskDraft({ ...taskDraft, emailReminder: event.target.checked })} /> Send an email reminder to someone at the due time (requires sign in)</label><label className="field full">Checklist<div className="inline-add"><TextInput value={subtaskText} onChange={(event) => setSubtaskText(event.target.value)} placeholder="Add checklist item" /><AppButton type="button" className="iconbtn" onClick={() => { if (subtaskText.trim()) { setTaskDraft({ ...taskDraft, subtasks: [...(taskDraft.subtasks || []), { text: subtaskText.trim(), done: false }] }); setSubtaskText(''); } }}>＋</AppButton></div><div className="chip-list">{(taskDraft.subtasks || []).map((item, index) => <AppButton type="button" className="chip" key={`${item.text}-${index}`} onClick={() => setTaskDraft({ ...taskDraft, subtasks: taskDraft.subtasks.filter((_, i) => i !== index) })}>{item.text} ×</AppButton>)}</div></label><label className="field full">Attachments<TextInput type="file" multiple onChange={(event) => setAttachmentFiles([...attachmentFiles, ...[...event.target.files].map((file) => ({ name: file.name, size: file.size, type: file.type }))])} /><div className="chip-list">{attachmentFiles.map((file, index) => <AppButton type="button" className="chip" key={`${file.name}-${index}`} onClick={() => setAttachmentFiles(attachmentFiles.filter((_, i) => i !== index))}>{file.name} ×</AppButton>)}</div></label><label className="field full">Task notes<textarea rows="3" value={taskDraft.notes || ''} onChange={(event) => setTaskDraft({ ...taskDraft, notes: event.target.value })} /></label></div></details>
       <div className="modal-actions">{editingId && <AppButton type="button" className="delete-task" onClick={() => { const task = tasks.find((item) => item.id === editingId); if (task) deleteTask(task); }}>Delete task</AppButton>}<AppButton className="save-task" loading={busyAction === 'save-task'}>{busyAction === 'save-task' ? 'Saving…' : 'Save task'}</AppButton></div></form></Modal>}
+    {modal === 'confirmation' && confirmation && <Modal title={confirmation.title} onClose={() => { setConfirmation(null); setModal(null); }}><p className="auth-copy">{confirmation.message}</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => { setConfirmation(null); setModal(null); }}>Cancel</AppButton><AppButton className="delete-series-button" loading={busyAction.startsWith('delete-')} onClick={confirmRequestedAction}>{confirmation.confirmLabel || 'Confirm'}</AppButton></div></Modal>}
     {modal === 'delete-recurring' && deleteTarget && <Modal title="Delete recurring task" onClose={() => { setModal(null); setDeleteTarget(null); }}><p className="auth-copy">Delete only this occurrence, or remove every task in the “{deleteTarget.recurrence}” series?</p><div className="delete-recurring-actions"><AppButton className="secondary-button" loading={busyAction === `delete-${deleteTarget.id}`} onClick={() => performDeleteTask(deleteTarget, false)}>Delete this task</AppButton><AppButton className="delete-series-button" loading={busyAction === `delete-${deleteTarget.id}`} onClick={() => performDeleteTask(deleteTarget, true)}>Delete all in series</AppButton></div></Modal>}
     {modal === 'calendar-conflict' && <Modal title="Calendar time conflict" onClose={() => { setModal('task'); setCalendarConflicts([]); setPendingTaskPayload(null); }}><p className="auth-copy">This task is close to an event in your Google Calendar. Do you want to create it anyway?</p><div className="calendar-conflict-list">{calendarConflicts.slice(0, 4).map((event) => <div className="calendar-conflict-item" key={event.id}><strong>{event.title}</strong><span>{event.allDay ? fmtDate(event.start, { weekday: 'short', month: 'short', day: 'numeric' }) + ' · All day' : `${fmtDate(event.start, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} – ${fmtDate(event.end, { hour: 'numeric', minute: '2-digit' })}`}</span></div>)}</div><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => { setModal('task'); setCalendarConflicts([]); setPendingTaskPayload(null); }}>Cancel</AppButton><AppButton className="save-task" loading={busyAction === 'save-task'} onClick={confirmCalendarConflict}>Create task anyway</AppButton></div></Modal>}    {modal === 'auth' && <Modal title={authMode === 'signup' ? 'Create your account' : 'Log in'} onClose={() => { if (pendingReminder) setPendingReminder(null); setModal(null); }}><p className="auth-copy">{pendingReminder ? 'Sign in to continue with your email reminder. Your task is saved.' : 'Use your email and password to access scheduled actions.'}</p><AppButton type="button" className="google-auth-button" loading={busyAction === 'google-auth'} disabled={!googleAuthReady} onClick={startGoogleSignIn}><GoogleMark />{busyAction === 'google-auth' ? 'Connecting…' : 'Continue with Google'}</AppButton>{!googleAuthReady && <small className="google-auth-hint">Google sign-in needs the frontend Supabase publishable key.</small>}<div className="auth-divider"><span>or use email</span></div><form className="task-form" onSubmit={authenticate}><label className="field">Email<TextInput required type="email" autoComplete="email" value={authDraft.email} onChange={(event) => setAuthDraft({ ...authDraft, email: event.target.value })} /></label><PasswordField label="Password" required minLength={authMode === 'signup' ? 8 : undefined} autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} value={authDraft.password} onChange={(event) => setAuthDraft({ ...authDraft, password: event.target.value })} /><div className="modal-actions auth-actions"><AppButton className="save-task" loading={busyAction === 'auth'}>{busyAction === 'auth' ? 'Please wait…' : authMode === 'signup' ? 'Sign up' : 'Log in'}</AppButton><AppButton type="button" className="secondary-button" onClick={() => setAuthMode(authMode === 'signup' ? 'login' : 'signup')}>{authMode === 'signup' ? 'I have an account' : 'Create account'}</AppButton></div></form>{authMode === 'login' && <AppButton className="text-link" onClick={() => { setPasswordResetEmail(authDraft.email); setModal('forgot-password'); }}>Forgot password?</AppButton>}</Modal>}
     {modal === 'forgot-password' && <Modal title="Reset your password" onClose={() => setModal('auth')}><p className="auth-copy">Enter your account email. If it matches an account, we’ll send a reset link.</p><form className="task-form" onSubmit={requestPasswordReset}><label className="field">Email<TextInput required type="email" autoComplete="email" value={passwordResetEmail} onChange={(event) => setPasswordResetEmail(event.target.value)} /></label><div className="modal-actions auth-actions"><AppButton type="button" className="secondary-button" onClick={() => setModal('auth')}>Back to log in</AppButton><AppButton className="save-task" loading={busyAction === 'password-reset-request'}>{busyAction === 'password-reset-request' ? 'Sending…' : 'Send reset link'}</AppButton></div></form></Modal>}
