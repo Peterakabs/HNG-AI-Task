@@ -281,11 +281,30 @@ function App() {
 
   useEffect(() => { reload(); }, [reload]);
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const result = params.get('googleCalendar');
+    if (!result) return;
+    const reason = params.get('reason');
+    window.history.replaceState({}, '', window.location.pathname);
+    if (result === 'connected') {
+      void reload();
+      showFeedback('success', 'Google Calendar is connected. Your events will appear in Calendar view.', 'Connected');
+    } else {
+      const message = reason === 'setup'
+        ? 'Google Calendar OAuth is not configured on the backend. Check the Google OAuth client ID, client secret, redirect URL, and token encryption key in Render.'
+        : reason === 'denied'
+          ? 'Google Calendar access was not approved. Try again and allow access to view your calendar events.'
+          : 'Google Calendar could not be connected. Please try again and approve the requested Calendar permission.';
+      showFeedback('error', message, reason === 'setup' ? 'Google Calendar setup required' : 'Google Calendar connection failed');
+    }
+  }, [reload, showFeedback]);
+  useEffect(() => {
     if (!googleAuth || loading) return undefined;
     const completeGoogleFlow = async () => {
       const intent = sessionStorage.getItem('spectre.google.intent');
       if (!intent) return;
       sessionStorage.removeItem('spectre.google.intent');
+      if (intent !== 'signin') return;
       try {
         const { data, error } = await googleAuth.auth.getSession();
         if (error) throw error;
@@ -293,24 +312,16 @@ function App() {
         if (!session) throw new Error('Google sign-in did not finish. Please try again.');
         const identity = session.user?.identities?.some((item) => item.provider === 'google') || session.user?.app_metadata?.provider === 'google';
         if (!identity) throw new Error('The Google identity could not be verified. Please try again.');
-        if (intent === 'calendar') {
-          if (!session.provider_refresh_token) throw new Error('Google did not return calendar refresh access. Reconnect and approve the requested Calendar permission.');
-          await api('/google-calendar/connect', { method: 'POST', body: { refreshToken: session.provider_refresh_token, email: session.user.email } });
-          await api('/auth/google/session', { method: 'POST', body: { accessToken: session.access_token, refreshToken: session.refresh_token } });
-          setGoogleCalendarStatus({ connected: true, email: session.user.email || null }); notify('Google Calendar connected.');
-        } else {
-          const user = await api('/auth/google/session', { method: 'POST', body: { accessToken: session.access_token, refreshToken: session.refresh_token } });
-          const hasGuestData = tasks.length > 0 || notes.length > 0 || tags.length > 0 || folders.some((folder) => !['Personal', 'Work'].includes(folder));
-          setAuthUser(user);
-          if (hasGuestData) { setGuestTransferSummary({ tasks: tasks.length, notes: notes.length }); setModal('guest-transfer'); }
-          else if (pendingReminder) setModal('recipient');
-          else showFeedback('success', 'You are signed in with Google.');
-          await reload();
-        }
+        const user = await api('/auth/google/session', { method: 'POST', body: { accessToken: session.access_token, refreshToken: session.refresh_token } });
+        const hasGuestData = tasks.length > 0 || notes.length > 0 || tags.length > 0 || folders.some((folder) => !['Personal', 'Work'].includes(folder));
+        setAuthUser(user);
+        if (hasGuestData) { setGuestTransferSummary({ tasks: tasks.length, notes: notes.length }); setModal('guest-transfer'); }
+        else if (pendingReminder) setModal('recipient');
+        else showFeedback('success', 'You are signed in with Google.');
+        await reload();
         window.history.replaceState({}, '', window.location.pathname);
         sessionStorage.removeItem('spectre-google-oauth-session');
         sessionStorage.removeItem('spectre-google-oauth-session-code-verifier');
-        if (intent === 'calendar') await reload();
       } catch (err) {
         sessionStorage.removeItem('spectre.google.intent');
         showFeedback('error', err.message || 'Google authentication failed.');
@@ -495,21 +506,7 @@ function App() {
   }
   async function connectGoogleCalendar() {
     setBusyAction('google-calendar');
-    try {
-      const client = requireGoogleAuth();
-      const current = await api('/auth/google/link-session');
-      const { error: sessionError } = await client.auth.setSession(current.session);
-      if (sessionError) throw sessionError;
-      sessionStorage.setItem('spectre.google.intent', 'calendar');
-      const { error } = await client.auth.linkIdentity({ provider: 'google', options: { redirectTo: window.location.origin, scopes: 'https://www.googleapis.com/auth/calendar.events.readonly', queryParams: { access_type: 'offline', prompt: 'consent' } } });
-      if (error) throw error;
-    } catch (err) {
-      sessionStorage.removeItem('spectre.google.intent');
-      if (err.code === 'manual_linking_disabled' || /manual linking is disabled/i.test(err.message || '')) {
-        showFeedback('error', 'Supabase has manual identity linking turned off. In Supabase Dashboard, open Authentication → Settings, enable “Allow manual linking,” save, then try connecting Google Calendar again.', 'Google Calendar setup required');
-      } else showFeedback('error', err.message);
-    }
-    finally { setBusyAction(''); }
+    window.location.assign('/api/google-calendar/oauth/start');
   }
   async function disconnectGoogleCalendar() {
     setBusyAction('google-calendar-disconnect');
@@ -761,7 +758,7 @@ function App() {
     <main className={`center ${mobileFiltersOpen ? 'filters-open' : ''}`}>
       <header className="topline"><AppButton className="iconbtn mobile-menu" title="Open navigation" aria-label="Open navigation" aria-expanded={navOpen} onClick={() => setNavOpen((value) => !value)}>☰</AppButton><div className="top-heading"><div className="date-kicker">{fmtDate(new Date(), { weekday: 'long', month: 'long', day: 'numeric' })}</div><h1>{viewTitle[0]}<span>{viewTitle[1]}</span></h1></div><div className="top-actions">{view !== 'profile' && <AppButton className="primary-add" onClick={() => startCreateTask()}>＋ New task</AppButton>}<AppButton className="username-button profile-chip" title="Open profile" onClick={() => changeView('profile')}><span className="profile-chip-avatar">{(profileDraft.avatarUrl || authUser?.avatarUrl) ? <img src={profileDraft.avatarUrl || authUser?.avatarUrl} alt="" /> : (username || 'U').slice(0, 1).toUpperCase()}</span><span>{username}</span></AppButton></div></header>
       <section className="progressbox"><div className="progress-icon">✳</div><div className="progress-copy"><div className="progress-title">{percentDone === 100 ? 'Beautifully done' : tasks.length - totalDone ? `${tasks.length - totalDone} ${tasks.length - totalDone === 1 ? 'task' : 'tasks'} in your hands` : 'A fresh start'}</div><div className="progress-sub">{totalDone ? `${totalDone} ${totalDone === 1 ? 'task' : 'tasks'} completed — keep going.` : 'Small steps make a meaningful day.'}</div></div><div className="progress-track"><div className="progress-fill" style={{ width: `${percentDone}%` }} /></div><div className="progress-num">{percentDone}%</div></section>
-      {view === 'profile' ? <ProfilePage username={username} authUser={authUser} profileDraft={profileDraft} setProfileDraft={setProfileDraft} onUpdate={saveProfile} onPasswordUpdate={savePassword} onAvatarChange={updateProfileImage} busyAction={busyAction} googleCalendarStatus={googleCalendarStatus} googleCalendarReady={googleAuthReady} onConnectCalendar={connectGoogleCalendar} onDisconnectCalendar={disconnectGoogleCalendar} onSignIn={() => { setAuthMode('signup'); setModal('auth'); }} /> : view !== 'calendar' ? <>
+      {view === 'profile' ? <ProfilePage username={username} authUser={authUser} profileDraft={profileDraft} setProfileDraft={setProfileDraft} onUpdate={saveProfile} onPasswordUpdate={savePassword} onAvatarChange={updateProfileImage} busyAction={busyAction} googleCalendarStatus={googleCalendarStatus} onConnectCalendar={connectGoogleCalendar} onDisconnectCalendar={disconnectGoogleCalendar} onSignIn={() => { setAuthMode('signup'); setModal('auth'); }} /> : view !== 'calendar' ? <>
         <div className="toolbar"><h2>{listTitle}</h2><div className="toolbar-actions"><TextInput className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by title" aria-label="Search tasks by title" /><AppButton className="filter-toggle" aria-expanded={mobileFiltersOpen} aria-controls="task-filters" onClick={() => setMobileFiltersOpen((open) => !open)}>Filter</AppButton></div></div>
         <div className={`filters ${mobileFiltersOpen ? 'filters-open' : ''}`} id="task-filters"><label className="sort-control">Sort<select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort tasks"><option value="manual">Manual order</option><option value="due">Due date</option><option value="priority">Priority</option><option value="created">Creation date</option><option value="alpha">Alphabetical</option></select></label><AppButton className="create-tag-btn" onClick={openTagForm}>＋ Create tag</AppButton><select aria-label="Filter status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="">Any status</option>{['To Do', 'Pending', 'Acknowledged', 'In Progress', 'Completed'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter priority" value={filters.priority} onChange={(event) => setFilters({ ...filters, priority: event.target.value })}><option value="">Any priority</option>{['High', 'Medium', 'Low'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter tag" value={filters.tag} onChange={(event) => setFilters({ ...filters, tag: event.target.value })}><option value="">Any tag</option>{tags.map((tag) => <option key={tag}>{tag}</option>)}</select><select aria-label="Filter folder" value={filters.folder} onChange={(event) => setFilters({ ...filters, folder: event.target.value })}><option value="">Any folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select><select aria-label="Filter date" value={filters.date} onChange={(event) => setFilters({ ...filters, date: event.target.value })}><option value="">Any date</option><option value="overdue">Overdue</option><option value="today">Due today</option><option value="week">Next 7 days</option><option value="none">No due date</option></select></div>
         {view === 'all' && <section className="weekly-review" aria-label="Weekly summaries"><div className="weekly-review-heading"><div><h2>Weekly task view</h2><p>Showing this week’s tasks · {fmtDate(`${currentWeek.start}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${currentWeek.end}T12:00:00`, { month: 'short', day: 'numeric' })}</p></div><strong>{completedThisWeek} completed this week</strong></div><div className="weekly-review-list"><h3>Past weekly summaries</h3>{weeklySummaries.length ? weeklySummaries.map((summary) => <article className="weekly-summary-row" key={summary.id}><div className="weekly-summary-label"><strong>{fmtDate(`${summary.weekStart}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${summary.weekEnd}T12:00:00`, { month: 'short', day: 'numeric', year: 'numeric' })}</strong><span>{summary.tasks.length} task{summary.tasks.length === 1 ? '' : 's'} completed</span></div><div className="weekly-summary-actions"><AppButton className="text-link" onClick={() => openWeeklySummary(summary)}>View summary</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'word')}>Word document</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'excel')}>Excel workbook</AppButton></div></article>) : <p className="weekly-summary-empty">Your first weekly report will appear here after this week ends.</p>}</div></section>}
@@ -1103,7 +1100,7 @@ function VoiceTextArea({ value, onChange, format = 'bullets', dictationRef, ...p
   return <div className="voice-note-field"><textarea {...props} value={value} onChange={(event) => { valueRef.current = event.target.value; onChange(event.target.value); }} /><div className="voice-note-controls"><AppButton type="button" className={`voice-note-button ${listening ? 'listening' : ''}`} aria-label={listening ? 'Stop dictation' : 'Dictate note'} title={listening ? 'Stop dictation' : 'Dictate note'} onClick={toggleVoice}>{listening ? <span aria-hidden="true">■</span> : <svg className="voice-mic-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.8"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>}<span>{listening ? 'Stop dictation' : 'Dictate lecture'}</span></AppButton>{listening && <span className="dictation-live"><i /> Recording — tap Stop when finished</span>}{unavailable && <small>Speech input is not supported in this browser. You can type your note.</small>}{interim && <small>Hearing: {interim}</small>}</div></div>;
 }
 
-function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpdate, onPasswordUpdate, onAvatarChange, busyAction, googleCalendarStatus, googleCalendarReady, onConnectCalendar, onDisconnectCalendar, onSignIn }) {
+function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpdate, onPasswordUpdate, onAvatarChange, busyAction, googleCalendarStatus, onConnectCalendar, onDisconnectCalendar, onSignIn }) {
   const [photoError, setPhotoError] = useState('');
   const avatar = profileDraft.avatarUrl || authUser?.avatarUrl;
   function selectPhoto(event) {
@@ -1118,7 +1115,7 @@ function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpda
   return <section className="profile-page" aria-label="Profile settings">
     <div className="profile-card profile-overview"><label className="profile-avatar-edit" title="Change profile image"><input type="file" accept="image/*" onChange={selectPhoto} aria-label="Choose profile image" /><span className="profile-avatar">{avatar ? <img src={avatar} alt={`${username}'s profile`} onError={(event) => { event.currentTarget.hidden = true; }} /> : (username || 'U').slice(0, 1).toUpperCase()}</span><span className="profile-avatar-edit-icon" aria-hidden="true">✎</span></label><div><span className="profile-eyebrow">{authUser ? 'Account profile' : 'Device profile'}</span><h2>{username}</h2><p>{authUser ? 'Manage your details and account security.' : 'This guest profile and its tasks stay on this device.'}</p>{photoError && <small className="profile-photo-error" role="alert">{photoError}</small>}{busyAction === 'profile-image' && <small>Updating photo…</small>}</div></div>
     <form className="profile-card profile-form" onSubmit={onUpdate}><h2>Personal details</h2><div className="form-grid"><label className="field">Username<TextInput required maxLength="80" value={profileDraft.username} onChange={(event) => setProfileDraft({ ...profileDraft, username: event.target.value })} /></label><label className="field">Phone number<TextInput type="tel" maxLength="40" value={profileDraft.phone} onChange={(event) => setProfileDraft({ ...profileDraft, phone: event.target.value })} placeholder="Add a phone number" /></label><label className="field full">Email<TextInput type="email" value={authUser?.email || 'Guest account — no email'} readOnly /></label></div><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'profile'}>{busyAction === 'profile' ? 'Updating…' : 'Update'}</AppButton></div></form>
-    <section className="profile-card google-calendar-card"><div><h2>Google Calendar</h2><p>View your Google Calendar events in Spectre and check for time conflicts when creating tasks.</p>{googleCalendarStatus?.connected && <small>Connected{googleCalendarStatus.email ? ` to ${googleCalendarStatus.email}` : ''}.</small>}</div>{authUser ? googleCalendarStatus?.connected ? <AppButton className="secondary-button" loading={busyAction === 'google-calendar-disconnect'} onClick={onDisconnectCalendar}>Disconnect</AppButton> : <AppButton className="save-task" loading={busyAction === 'google-calendar'} disabled={!googleCalendarReady} onClick={onConnectCalendar}><GoogleMark />{busyAction === 'google-calendar' ? 'Connecting…' : 'Connect Google Calendar'}</AppButton> : <AppButton className="secondary-button" onClick={onSignIn}>Sign in to connect</AppButton>}{!googleCalendarReady && <small className="google-auth-hint">Google connection needs the frontend Supabase publishable key.</small>}</section>{authUser ? <details className="profile-card password-collapse"><summary><h2>Change password</h2><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m6 9 6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg></summary><form className="profile-form" onSubmit={onPasswordUpdate}><p className="auth-copy">Confirm your current password before choosing a new one.</p><div className="form-grid"><PasswordField name="currentPassword" label="Current password" required autoComplete="current-password" /><PasswordField name="newPassword" label="New password" required minLength="8" autoComplete="new-password" /><PasswordField name="confirmPassword" label="Confirm new password" required minLength="8" autoComplete="new-password" /></div><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'profile-password'}>{busyAction === 'profile-password' ? 'Updating…' : 'Update password'}</AppButton></div></form></details> : <div className="profile-card profile-signin"><h2>Want to access scheduled actions?</h2><p>Create an account or sign in to enable account features.</p><AppButton className="save-task" onClick={onSignIn}>Sign in or create account</AppButton></div>}
+    <section className="profile-card google-calendar-card"><div><h2>Google Calendar</h2><p>View your Google Calendar events in Spectre and check for time conflicts when creating tasks.</p>{googleCalendarStatus?.connected && <small>Connected{googleCalendarStatus.email ? ` to ${googleCalendarStatus.email}` : ''}.</small>}</div>{authUser ? googleCalendarStatus?.connected ? <AppButton className="secondary-button" loading={busyAction === 'google-calendar-disconnect'} onClick={onDisconnectCalendar}>Disconnect</AppButton> : <AppButton className="save-task" loading={busyAction === 'google-calendar'} onClick={onConnectCalendar}><GoogleMark />{busyAction === 'google-calendar' ? 'Connecting…' : 'Connect Google Calendar'}</AppButton> : <AppButton className="secondary-button" onClick={onSignIn}>Sign in to connect</AppButton>}</section>{authUser ? <details className="profile-card password-collapse"><summary><h2>Change password</h2><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m6 9 6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg></summary><form className="profile-form" onSubmit={onPasswordUpdate}><p className="auth-copy">Confirm your current password before choosing a new one.</p><div className="form-grid"><PasswordField name="currentPassword" label="Current password" required autoComplete="current-password" /><PasswordField name="newPassword" label="New password" required minLength="8" autoComplete="new-password" /><PasswordField name="confirmPassword" label="Confirm new password" required minLength="8" autoComplete="new-password" /></div><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'profile-password'}>{busyAction === 'profile-password' ? 'Updating…' : 'Update password'}</AppButton></div></form></details> : <div className="profile-card profile-signin"><h2>Want to access scheduled actions?</h2><p>Create an account or sign in to enable account features.</p><AppButton className="save-task" onClick={onSignIn}>Sign in or create account</AppButton></div>}
   </section>;
 }
 
