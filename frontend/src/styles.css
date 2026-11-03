@@ -351,3 +351,19 @@ html[data-theme="dark"] .delete-series-button{background:#392624;color:#ffb6a9;b
 .calendar-conflict-item span{font-size:13px;color:var(--muted)}
 html[data-theme="dark"] .cal-google-event{background:#183625;color:#ace5b6}
 @media(max-width:680px){.google-calendar-card{align-items:flex-start;flex-direction:column}.google-calendar-card>.app-button{width:100%}.google-auth-button{min-height:48px}}
+
+/* Profile password dropdown, dismissible notification popover, and tag removal */
+.password-collapse{padding:0;overflow:hidden}
+.password-collapse>summary{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:clamp(18px,3vw,28px);cursor:pointer;list-style:none;user-select:none}
+.password-collapse>summary::-webkit-details-marker{display:none}
+.password-collapse>summary h2{margin:0;font-size:17px;letter-spacing:-.3px}
+.password-collapse>summary svg{width:19px;height:19px;flex:none;color:var(--muted);transition:transform .18s ease}
+.password-collapse[open]>summary svg{transform:rotate(180deg)}
+.password-collapse>.profile-form{padding:0 clamp(18px,3vw,28px) clamp(18px,3vw,28px)}
+.password-collapse .auth-copy{margin:0 0 14px}
+.tag-row{display:flex;align-items:center;gap:3px;min-width:0}
+.tag-row .tagline{flex:1;min-width:0;display:flex;align-items:center;gap:9px;padding:8px 10px;border:0;border-radius:8px;background:transparent;color:var(--soft-text);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag-row .tagline:hover{background:var(--soft);color:var(--blue)}
+.tag-delete{width:30px;height:30px;display:grid;place-items:center;flex:none;padding:5px;color:var(--muted)}
+.tag-delete svg{width:15px;height:15px}
+.tag-delete:hover{background:#feecec;color:#c63f3f}
