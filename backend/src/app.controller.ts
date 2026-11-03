@@ -100,12 +100,44 @@ export class AppController {
   @Put('profile') updateProfile(@Body() body: Record<string, any>) { return this.service.updateProfile(body); }
   @Put('auth/password') updatePassword(@Req() request: IdentityRequest, @Body() body: Record<string, any>) { return this.auth.changePassword(this.requireUser(request), body); }
 
+  @Get('google-calendar/oauth/start') startGoogleCalendarOAuth(@Req() request: IdentityRequest, @Res() response: Response) {
+    try {
+      const userId = this.requireUser(request);
+      const { authorizationUrl, nonce } = this.googleCalendar.beginOAuth(userId);
+      response.cookie('spectre_google_calendar_oauth_state', nonce, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/api/google-calendar/oauth', maxAge: 10 * 60 * 1000 });
+      return response.redirect(302, authorizationUrl);
+    } catch (error) {
+      return response.redirect(302, this.googleCalendar.callbackUrl('error', this.oauthErrorReason(error)));
+    }
+  }
+  @Get('google-calendar/oauth/callback') async completeGoogleCalendarOAuth(@Req() request: IdentityRequest, @Res() response: Response) {
+    try {
+      const userId = this.requireUser(request);
+      const providerError = typeof request.query.error === 'string' ? request.query.error : '';
+      if (providerError) throw new UnauthorizedException(providerError === 'access_denied' ? 'Google Calendar permission was declined.' : 'Google Calendar authorization did not complete.');
+      const code = typeof request.query.code === 'string' ? request.query.code : '';
+      const state = typeof request.query.state === 'string' ? request.query.state : '';
+      const stateCookie = this.readCookie(request.headers.cookie, 'spectre_google_calendar_oauth_state');
+      await this.googleCalendar.completeOAuth(userId, code, state, stateCookie);
+      response.clearCookie('spectre_google_calendar_oauth_state', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/api/google-calendar/oauth' });
+      return response.redirect(303, this.googleCalendar.callbackUrl('connected'));
+    } catch (error) {
+      response.clearCookie('spectre_google_calendar_oauth_state', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/api/google-calendar/oauth' });
+      return response.redirect(303, this.googleCalendar.callbackUrl('error', this.oauthErrorReason(error)));
+    }
+  }
   @Get('google-calendar/status') googleCalendarStatus(@Req() request: IdentityRequest) { return this.googleCalendar.status(this.requireUser(request)); }
   @Get('google-calendar/events') googleCalendarEvents(@Req() request: IdentityRequest, @Query('timeMin') timeMin: string, @Query('timeMax') timeMax: string) { return this.googleCalendar.events(this.requireUser(request), timeMin, timeMax); }
   @Get('google-calendar/conflicts') googleCalendarConflicts(@Req() request: IdentityRequest, @Query('due') due: string, @Query('localDate') localDate?: string) { return this.googleCalendar.conflicts(this.requireUser(request), due, localDate); }
-  @Post('google-calendar/connect') connectGoogleCalendar(@Req() request: IdentityRequest, @Body() body: Record<string, unknown>) { return this.googleCalendar.connect(this.requireUser(request), body); }
   @Delete('google-calendar/connect') disconnectGoogleCalendar(@Req() request: IdentityRequest) { return this.googleCalendar.disconnect(this.requireUser(request)); }
 
   private requireUser(request: IdentityRequest) { if (request.identity?.type !== 'user') throw new UnauthorizedException('Sign in to use scheduled actions.'); return request.identity.id; }
+  private readCookie(header: string | undefined, name: string) { const prefix = `${name}=`; return header?.split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length) || ''; }
+  private oauthErrorReason(error: unknown) {
+    const message = error instanceof Error ? error.message : '';
+    if (/not configured|must be an absolute|must use HTTPS/i.test(message)) return 'setup';
+    if (/permission was declined/i.test(message)) return 'denied';
+    return 'failed';
+  }
   private setSession(response: Response, session: string) { response.cookie('spectre_session', session, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 24 * 60 * 60 * 1000 }); }
 }
