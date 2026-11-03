@@ -13,6 +13,8 @@ export class ScopeContext {
 
 export interface SpectreData {
   tasks: Record<string, any>[];
+  weeklySummaries?: Record<string, any>[];
+  weeklySummaryThrough?: string;
   folders: string[];
   tags: string[];
   notes: Record<string, any>[];
@@ -47,8 +49,9 @@ export class SupabaseStore {
   }
 
   private attachRevision(data: SpectreData, revision: number) {
+    data.weeklySummaries ??= [];
     Object.defineProperty(data, '__revision', { value: revision, writable: true, configurable: true, enumerable: false });
     return data;
   }
-  private emptyData(): SpectreData { return { tasks: [], folders: ['Personal', 'Work'], tags: [], notes: [], username: `User${Math.floor(1000 + Math.random() * 9000)}` }; }
+  private emptyData(): SpectreData { return { tasks: [], weeklySummaries: [], folders: ['Personal', 'Work'], tags: [], notes: [], username: `User${Math.floor(1000 + Math.random() * 9000)}` }; }
 }

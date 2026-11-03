@@ -54,8 +54,68 @@ const resolveGuestAccount = () => {
 
 const isoDate = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 const localToday = () => isoDate(new Date());
+const localDateFromTimestamp = (value) => value ? isoDate(new Date(value)) : '';
+const localWeekRange = (value = new Date()) => {
+  const start = new Date(value.getFullYear(), value.getMonth(), value.getDate());
+  start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+  const end = new Date(start); end.setDate(end.getDate() + 6);
+  return { start: isoDate(start), end: isoDate(end) };
+};
 const uid = () => Math.random().toString(36).slice(2, 10);
 const fmtDate = (value, options = { month: 'short', day: 'numeric' }) => value ? new Intl.DateTimeFormat(undefined, options).format(new Date(value)) : '';
+const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+const escapeXml = (value = '') => String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[character]));
+const downloadFile = (filename, content, type) => {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+const buildXlsx = (rows) => {
+  const encoder = new TextEncoder();
+  const columnName = (index) => { let name = ''; for (let value = index + 1; value; value = Math.floor((value - 1) / 26)) name = String.fromCharCode(65 + ((value - 1) % 26)) + name; return name; };
+  const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rows.map((row, rowIndex) => `<row r="${rowIndex + 1}">${row.map((cell, columnIndex) => { const address = `${columnName(columnIndex)}${rowIndex + 1}`; return typeof cell === 'number' ? `<c r="${address}" t="n"><v>${cell}</v></c>` : `<c r="${address}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(cell ?? '')}</t></is></c>`; }).join('')}</row>`).join('')}</sheetData></worksheet>`;
+  const files = [
+    ['[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'],
+    ['_rels/.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'],
+    ['xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Weekly Summary" sheetId="1" r:id="rId1"/></sheets></workbook>'],
+    ['xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'],
+    ['xl/worksheets/sheet1.xml', sheet],
+  ].map(([name, content]) => ({ name: encoder.encode(name), data: encoder.encode(content) }));
+  const crc32 = (bytes) => { let crc = 0xffffffff; for (const byte of bytes) { crc ^= byte; for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0); } return (crc ^ 0xffffffff) >>> 0; };
+  const localParts = []; const centralParts = []; let offset = 0; let centralSize = 0;
+  const date = 0x21;
+  for (const file of files) {
+    const checksum = crc32(file.data);
+    const local = new Uint8Array(30 + file.name.length + file.data.length); const localView = new DataView(local.buffer);
+    localView.setUint32(0, 0x04034b50, true); localView.setUint16(4, 20, true); localView.setUint16(10, 0, true); localView.setUint16(12, 0, true); localView.setUint16(14, date, true); localView.setUint32(16, checksum, true); localView.setUint32(20, file.data.length, true); localView.setUint32(24, file.data.length, true); localView.setUint16(26, file.name.length, true);
+    local.set(file.name, 30); local.set(file.data, 30 + file.name.length); localParts.push(local);
+    const central = new Uint8Array(46 + file.name.length); const centralView = new DataView(central.buffer);
+    centralView.setUint32(0, 0x02014b50, true); centralView.setUint16(4, 20, true); centralView.setUint16(6, 20, true); centralView.setUint16(10, 0, true); centralView.setUint16(12, 0, true); centralView.setUint16(14, date, true); centralView.setUint32(16, checksum, true); centralView.setUint32(20, file.data.length, true); centralView.setUint32(24, file.data.length, true); centralView.setUint16(28, file.name.length, true); centralView.setUint32(42, offset, true);
+    central.set(file.name, 46); centralParts.push(central); offset += local.length; centralSize += central.length;
+  }
+  const end = new Uint8Array(22); const endView = new DataView(end.buffer);
+  endView.setUint32(0, 0x06054b50, true); endView.setUint16(8, files.length, true); endView.setUint16(10, files.length, true); endView.setUint32(12, centralSize, true); endView.setUint32(16, offset, true);
+  const result = new Uint8Array(offset + centralSize + end.length); let cursor = 0;
+  for (const part of [...localParts, ...centralParts, end]) { result.set(part, cursor); cursor += part.length; }
+  return result;
+};
+const exportWeeklySummary = (summary, username, format) => {
+  const weekLabel = `${fmtDate(`${summary.weekStart}T12:00:00`, { month: 'long', day: 'numeric', year: 'numeric' })} – ${fmtDate(`${summary.weekEnd}T12:00:00`, { month: 'long', day: 'numeric', year: 'numeric' })}`;
+  const filename = `spectre-weekly-summary-${summary.weekStart}`;
+  if (format === 'excel') {
+    const rows = [
+      ['Spectre weekly summary', weekLabel], ['Completed by', username], ['Tasks completed', summary.tasks.length], [],
+      ['Task', 'Description', 'Priority', 'Folder', 'Tags', 'Due date', 'Completed at', 'Task notes', 'Completed checklist items', 'Attachments'],
+      ...summary.tasks.map((task) => [task.title, task.description, task.priority, task.folder, (task.tags || []).join(', '), task.due ? fmtDate(task.due, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '', task.completedAt ? fmtDate(task.completedAt, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '', task.notes, (task.subtasks || []).filter((item) => item.done).map((item) => item.text).join('; '), (task.attachments || []).map((file) => file.name).join('; ')])
+    ];
+    downloadFile(`${filename}.xlsx`, buildXlsx(rows), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    return;
+  }
+  const taskDetails = summary.tasks.length ? summary.tasks.map((task) => `<li><strong>${escapeHtml(task.title)}</strong>${task.description ? `<p>${escapeHtml(task.description)}</p>` : ''}<p>Priority: ${escapeHtml(task.priority || 'Not set')}${task.folder ? ` · Folder: ${escapeHtml(task.folder)}` : ''}${task.tags?.length ? ` · Tags: ${escapeHtml(task.tags.join(', '))}` : ''}</p>${task.due ? `<p>Due: ${escapeHtml(fmtDate(task.due, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }))}</p>` : ''}${task.notes ? `<p>Notes: ${escapeHtml(task.notes)}</p>` : ''}${task.subtasks?.some((item) => item.done) ? `<p>Checklist completed: ${escapeHtml(task.subtasks.filter((item) => item.done).map((item) => item.text).join(', '))}</p>` : ''}${task.attachments?.length ? `<p>Attachments: ${escapeHtml(task.attachments.map((file) => file.name).join(', '))}</p>` : ''}</li>`).join('') : '<li>No tasks were completed this week. Take a moment to plan your next steps.</li>';
+  const narrative = summary.tasks.length === 1 ? `You completed 1 task this week: ${escapeHtml(summary.tasks[0].title)}.` : `You completed ${summary.tasks.length} tasks this week. Here is what you accomplished:`;
+  const documentHtml = `<!doctype html><html><head><meta charset="utf-8"><title>Spectre weekly summary</title><style>body{font:11pt Arial,sans-serif;color:#111;line-height:1.5;margin:40px}h1{color:#3157d5;margin-bottom:4px}h2{margin-top:26px}p.meta{color:#555;margin-top:0}li{margin:0 0 18px}li p{margin:4px 0}</style></head><body><h1>Your week in Spectre</h1><p class="meta">${escapeHtml(weekLabel)}</p><p>Hello ${escapeHtml(username)},</p><p>${narrative}</p><h2>What you completed</h2><ol>${taskDetails}</ol><p>Keep building on this progress next week.</p></body></html>`;
+  downloadFile(`${filename}.doc`, documentHtml, 'application/msword;charset=utf-8');
+};
 const deliveryStatusLabel = (status) => ({ scheduled: 'Scheduled', processing: 'Processing', sending: 'Processing', sent: 'Accepted by provider', completed: 'Accepted by provider', failed: 'Failed', cancelled: 'Cancelled' }[status] || status);
 const parseReminderRequest = (value) => {
   const time = '(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)';
@@ -85,6 +145,8 @@ const emptyTask = (defaults = {}) => ({
 
 function App() {
   const [tasks, setTasks] = useState([]);
+  const [weeklySummaries, setWeeklySummaries] = useState([]);
+  const [activeWeeklySummary, setActiveWeeklySummary] = useState(null);
   const [folders, setFolders] = useState([]);
   const [tags, setTags] = useState([]);
   const [notes, setNotes] = useState([]);
@@ -157,6 +219,14 @@ function App() {
       if (![nextTasks, nextFolders, nextTags, nextNotes].every(Array.isArray) || !profile?.username) throw new Error('The API returned an unexpected response. Restart the updated NestJS server and try again.');
       setTasks(nextTasks); setFolders(nextFolders); setTags(nextTags); setNotes(nextNotes);
       setUsername(profile.username); setAuthUser(user); setError('');
+      try {
+        const summaries = await api(`/weekly-summaries?timezone=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`);
+        if (Array.isArray(summaries)) {
+          setWeeklySummaries(summaries);
+          const activeTasks = await api('/tasks');
+          if (Array.isArray(activeTasks)) setTasks(activeTasks);
+        }
+      } catch (summaryError) { console.warn('[Spectre] Could not refresh weekly summaries:', summaryError.message); }
       if (user) {
         try { const result = await api('/notifications'); setNotifications(result.notifications || []); setUnreadNotificationCount(result.unreadCount || 0); }
         catch (notificationError) { console.warn('[Spectre] Could not load notifications:', notificationError.message); }
@@ -166,6 +236,23 @@ function App() {
   }, []);
 
   useEffect(() => { reload(); }, [reload]);
+  useEffect(() => {
+    const timer = window.setInterval(async () => {
+      try {
+        const summaries = await api(`/weekly-summaries?timezone=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`);
+        if (!Array.isArray(summaries)) return;
+        setWeeklySummaries(summaries);
+        const activeTasks = await api('/tasks');
+        if (Array.isArray(activeTasks)) setTasks(activeTasks);
+      } catch (summaryError) { console.warn('[Spectre] Could not check for a weekly summary:', summaryError.message); }
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (loading || modal || assistantOpen || selectedTask) return;
+    const unviewed = weeklySummaries.find((summary) => !summary.viewedAt);
+    if (unviewed) { setActiveWeeklySummary(unviewed); setModal('weekly-summary'); }
+  }, [weeklySummaries, loading, modal, assistantOpen, selectedTask]);
   useEffect(() => {
     if (!authUser) return undefined;
     const timer = window.setInterval(() => { refreshNotifications().catch((err) => console.warn('[Spectre] Could not refresh notifications:', err.message)); }, 30_000);
@@ -205,6 +292,18 @@ function App() {
     if (view === 'today') rows = rows.filter((task) => task.status !== 'Completed' && (!task.due || task.due.slice(0, 10) <= localToday()));
     if (view === 'upcoming') rows = rows.filter((task) => task.status !== 'Completed' && task.due && task.due.slice(0, 10) >= localToday());
     if (view === 'completed') rows = rows.filter((task) => task.status === 'Completed');
+    if (view === 'all') {
+      const week = localWeekRange();
+      rows = rows.filter((task) => {
+        if (task.status === 'Completed') {
+          const completed = localDateFromTimestamp(task.completedAt);
+          return !completed || (completed >= week.start && completed <= week.end);
+        }
+        const start = task.start?.slice(0, 10) || '';
+        const due = task.due?.slice(0, 10) || '';
+        return (start >= week.start && start <= week.end) || (due && due <= week.end);
+      });
+    }
     if (view === 'folder') rows = rows.filter((task) => task.folder === selectedFolder);
     if (view === 'tag') rows = rows.filter((task) => task.tags?.includes(selectedTag));
     if (filters.status) rows = rows.filter((task) => task.status === filters.status);
@@ -228,8 +327,10 @@ function App() {
   const totalDone = tasks.filter((task) => task.status === 'Completed').length;
   const percentDone = tasks.length ? Math.round(totalDone / tasks.length * 100) : 0;
   const todayCount = tasks.filter((task) => task.status !== 'Completed' && (!task.due || task.due.slice(0, 10) <= localToday())).length;
-  const viewTitle = view === 'calendar' ? ['Your ', 'calendar.'] : view === 'upcoming' ? ['Looking ', 'ahead.'] : view === 'completed' ? ['Look what ', 'you did.'] : view === 'folder' ? [`${selectedFolder} `, 'folder.'] : view === 'tag' ? ['Tagged ', `#${selectedTag}.`] : view === 'all' ? ['All your ', 'tasks.'] : ['Today, ', 'well spent.'];
-  const listTitle = view === 'today' ? 'Your tasks' : view === 'upcoming' ? 'Coming up' : view === 'completed' ? 'Completed' : view === 'folder' ? selectedFolder : view === 'tag' ? `#${selectedTag}` : 'All tasks';
+  const currentWeek = localWeekRange();
+  const completedThisWeek = tasks.filter((task) => task.status === 'Completed' && (!task.completedAt || (localDateFromTimestamp(task.completedAt) >= currentWeek.start && localDateFromTimestamp(task.completedAt) <= currentWeek.end))).length;
+  const viewTitle = view === 'calendar' ? ['Your ', 'calendar.'] : view === 'upcoming' ? ['Looking ', 'ahead.'] : view === 'completed' ? ['Look what ', 'you did.'] : view === 'folder' ? [`${selectedFolder} `, 'folder.'] : view === 'tag' ? ['Tagged ', `#${selectedTag}.`] : view === 'all' ? ['Your ', 'week.'] : ['Today, ', 'well spent.'];
+  const listTitle = view === 'today' ? 'Your tasks' : view === 'upcoming' ? 'Coming up' : view === 'completed' ? 'Completed' : view === 'folder' ? selectedFolder : view === 'tag' ? `#${selectedTag}` : 'This week';
 
   function changeView(next) { setView(next); setSelectedFolder(''); setSelectedTag(''); setNavOpen(false); }
   function startCreateTask(defaults = {}) { setEditingId(null); setTaskDraft(emptyTask(defaults)); setSubtaskText(''); setAttachmentFiles([]); setModal('task'); }
@@ -365,6 +466,15 @@ function App() {
     catch (err) { showFeedback('error', err.message); }
     finally { setBusyAction(''); }
   }
+  async function closeWeeklySummary() {
+    if (!activeWeeklySummary) { setModal(null); return; }
+    try {
+      const viewed = await api(`/weekly-summaries/${encodeURIComponent(activeWeeklySummary.id)}/viewed`, { method: 'POST' });
+      setWeeklySummaries((current) => current.map((summary) => summary.id === viewed.id ? viewed : summary));
+      setModal(null); setActiveWeeklySummary(null);
+    } catch (err) { showFeedback('error', err.message); }
+  }
+  function openWeeklySummary(summary) { setActiveWeeklySummary(summary); setModal('weekly-summary'); }
   async function createFolder(event) {
     event.preventDefault();
     setBusyAction('create-folder');
@@ -446,7 +556,8 @@ function App() {
       {view !== 'calendar' ? <>
         <div className="toolbar"><h2>{listTitle}</h2><div className="toolbar-actions"><TextInput className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by title" aria-label="Search tasks by title" /><AppButton className="filter-toggle" aria-expanded={mobileFiltersOpen} aria-controls="task-filters" onClick={() => setMobileFiltersOpen((open) => !open)}>Filter</AppButton></div></div>
         <div className={`filters ${mobileFiltersOpen ? 'filters-open' : ''}`} id="task-filters"><label className="sort-control">Sort<select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort tasks"><option value="manual">Manual order</option><option value="due">Due date</option><option value="priority">Priority</option><option value="created">Creation date</option><option value="alpha">Alphabetical</option></select></label><AppButton className="create-tag-btn" onClick={openTagForm}>＋ Create tag</AppButton><select aria-label="Filter status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="">Any status</option>{['To Do', 'Pending', 'Acknowledged', 'In Progress', 'Completed'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter priority" value={filters.priority} onChange={(event) => setFilters({ ...filters, priority: event.target.value })}><option value="">Any priority</option>{['High', 'Medium', 'Low'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter tag" value={filters.tag} onChange={(event) => setFilters({ ...filters, tag: event.target.value })}><option value="">Any tag</option>{tags.map((tag) => <option key={tag}>{tag}</option>)}</select><select aria-label="Filter folder" value={filters.folder} onChange={(event) => setFilters({ ...filters, folder: event.target.value })}><option value="">Any folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select><select aria-label="Filter date" value={filters.date} onChange={(event) => setFilters({ ...filters, date: event.target.value })}><option value="">Any date</option><option value="overdue">Overdue</option><option value="today">Due today</option><option value="week">Next 7 days</option><option value="none">No due date</option></select></div>
-        <section className="task-list" aria-label="Tasks">{loading ? <div className="empty">Loading your tasks…</div> : error ? <div className="empty"><strong>Could not load Spectre</strong><span>{error}</span><AppButton className="save-task" onClick={reload}>Retry</AppButton></div> : visibleTasks.length ? visibleTasks.map((task) => <TaskCard key={task.id} task={task} onToggle={toggleTask} onEdit={() => editTask(task)} onOpen={() => setSelectedTask(task)} onDrop={moveTask} />) : <div className="empty"><strong>{search ? 'No matching tasks' : view === 'folder' ? 'This folder is empty' : view === 'tag' ? 'No tasks use this tag yet' : view === 'completed' ? 'No completed tasks yet' : 'No tasks to show'}</strong><span>{view === 'folder' ? 'Create a task in this folder to get started.' : view === 'tag' ? 'Create a task with this tag to get started.' : search ? 'Clear your search or add a new task.' : 'Add a task whenever you’re ready.'}</span><div className="empty-actions"><AppButton className="save-task" onClick={() => startCreateTask({ folder: view === 'folder' ? selectedFolder : '', tag: view === 'tag' ? selectedTag : '' })}>Create task</AppButton></div></div>}</section>
+        {view === 'all' && <section className="weekly-review" aria-label="Weekly summaries"><div className="weekly-review-heading"><div><h2>Weekly task view</h2><p>Showing this week’s tasks · {fmtDate(`${currentWeek.start}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${currentWeek.end}T12:00:00`, { month: 'short', day: 'numeric' })}</p></div><strong>{completedThisWeek} completed this week</strong></div><div className="weekly-review-list"><h3>Past weekly summaries</h3>{weeklySummaries.length ? weeklySummaries.map((summary) => <article className="weekly-summary-row" key={summary.id}><div className="weekly-summary-label"><strong>{fmtDate(`${summary.weekStart}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${summary.weekEnd}T12:00:00`, { month: 'short', day: 'numeric', year: 'numeric' })}</strong><span>{summary.tasks.length} task{summary.tasks.length === 1 ? '' : 's'} completed</span></div><div className="weekly-summary-actions"><AppButton className="text-link" onClick={() => openWeeklySummary(summary)}>View summary</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'word')}>Word document</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'excel')}>Excel workbook</AppButton></div></article>) : <p className="weekly-summary-empty">Your first weekly report will appear here after this week ends.</p>}</div></section>}
+        <section className="task-list" aria-label="Tasks">{loading ? <div className="empty">Loading your tasks…</div> : error ? <div className="empty"><strong>Could not load Spectre</strong><span>{error}</span><AppButton className="save-task" onClick={reload}>Retry</AppButton></div> : visibleTasks.length ? visibleTasks.map((task) => <TaskCard key={task.id} task={task} onToggle={toggleTask} onEdit={() => editTask(task)} onOpen={() => setSelectedTask(task)} onDrop={moveTask} />) : <div className="empty"><strong>{search ? 'No matching tasks' : view === 'folder' ? 'This folder is empty' : view === 'tag' ? 'No tasks use this tag yet' : view === 'completed' ? 'No completed tasks yet' : view === 'all' ? 'No tasks planned for this week' : 'No tasks to show'}</strong><span>{view === 'folder' ? 'Create a task in this folder to get started.' : view === 'tag' ? 'Create a task with this tag to get started.' : search ? 'Clear your search or add a new task.' : view === 'all' ? 'Add this week’s tasks here. Later tasks remain in Upcoming.' : 'Add a task whenever you’re ready.'}</span><div className="empty-actions"><AppButton className="save-task" onClick={() => startCreateTask({ folder: view === 'folder' ? selectedFolder : '', tag: view === 'tag' ? selectedTag : '' })}>Create task</AppButton></div></div>}</section>
       </> : <CalendarView tasks={tasks} month={month} setMonth={setMonth} selectedDay={selectedDay} setSelectedDay={setSelectedDay} onCreate={(day = selectedDay) => { setSelectedDay(day); setMonth(new Date(`${day}T12:00:00`)); startCreateTask({ start: day, due: `${day}T09:00` }); }} onOpen={setSelectedTask} onToggle={toggleTask} onEdit={editTask} />}
     </main>
 
@@ -464,6 +575,7 @@ function App() {
     {modal === 'guest-transfer' && <Modal title="Transfer your guest tasks?" onClose={() => finishGuestTransition(false)}><p className="auth-copy">This device has {guestTransferSummary?.tasks || 0} task{guestTransferSummary?.tasks === 1 ? '' : 's'} and {guestTransferSummary?.notes || 0} note{guestTransferSummary?.notes === 1 ? '' : 's'} saved as a guest. You can merge them into this account. Existing account data stays intact and matching tasks are skipped.</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" loading={busyAction === 'finish-signin'} onClick={() => finishGuestTransition(false)}>Keep separate</AppButton><AppButton className="save-task" loading={busyAction === 'guest-transfer'} onClick={() => finishGuestTransition(true)}>Transfer guest data</AppButton></div></Modal>}
     {modal === 'recipient' && pendingReminder && <Modal title="Who should receive this reminder?" onClose={() => setModal(null)}><p className="auth-copy">Your task is saved. Add the recipient details before scheduling the email.</p><form className="task-form" onSubmit={continueToConfirmation}><label className="field">Name<TextInput required maxLength="200" value={recipientDraft.name} onChange={(event) => setRecipientDraft({ ...recipientDraft, name: event.target.value })} placeholder="Michael" /></label><label className="field">Email<TextInput required type="email" value={recipientDraft.email} onChange={(event) => setRecipientDraft({ ...recipientDraft, email: event.target.value })} placeholder="michael@example.com" /></label><div className="modal-actions"><AppButton type="button" className="secondary-button" onClick={() => { setModal(null); setPendingReminder(null); }}>Cancel reminder</AppButton><AppButton className="save-task">Continue</AppButton></div></form></Modal>}
     {modal === 'reminder-confirm' && pendingReminder && <Modal title="Confirm email reminder" onClose={() => setModal('recipient')}><div className="reminder-summary"><strong>{pendingReminder.recipientName}</strong><span>{pendingReminder.recipientEmail}</span><p>{pendingReminder.message}</p><span>{fmtDate(pendingReminder.scheduledAt, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · {Intl.DateTimeFormat().resolvedOptions().timeZone}</span></div><div className="modal-actions"><AppButton className="secondary-button" onClick={() => setModal('recipient')}>Edit recipient</AppButton><AppButton className="save-task" loading={busyAction === 'schedule-reminder'} onClick={scheduleReminder}>{busyAction === 'schedule-reminder' ? 'Scheduling…' : 'Schedule reminder'}</AppButton></div></Modal>}
+    {modal === 'weekly-summary' && activeWeeklySummary && <Modal title="Your weekly summary" className="weekly-summary-modal" onClose={closeWeeklySummary}><p className="weekly-summary-period">{fmtDate(`${activeWeeklySummary.weekStart}T12:00:00`, { month: 'long', day: 'numeric', year: 'numeric' })}–{fmtDate(`${activeWeeklySummary.weekEnd}T12:00:00`, { month: 'long', day: 'numeric', year: 'numeric' })}</p><p className="weekly-summary-intro">{activeWeeklySummary.tasks.length ? `You completed ${activeWeeklySummary.tasks.length} task${activeWeeklySummary.tasks.length === 1 ? '' : 's'} this week. Here’s a record of what you accomplished.` : 'You completed no tasks this week. Your weekly report is ready whenever you need it.'}</p>{activeWeeklySummary.tasks.length > 0 && <ol className="weekly-summary-task-list">{activeWeeklySummary.tasks.map((task) => <li key={task.id}><strong>{task.title}</strong>{task.description && <span>{task.description}</span>}<small>{task.priority}{task.folder ? ` · ${task.folder}` : ''}{task.completedAt ? ` · Completed ${fmtDate(task.completedAt, { month: 'short', day: 'numeric' })}` : ''}</small></li>)}</ol>}<div className="weekly-summary-export"><AppButton className="secondary-button" onClick={() => exportWeeklySummary(activeWeeklySummary, username, 'word')}>Download Word document</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(activeWeeklySummary, username, 'excel')}>Download Excel workbook (.xlsx)</AppButton><AppButton className="save-task" loading={busyAction === `view-week-${activeWeeklySummary.id}`} onClick={closeWeeklySummary}>Done</AppButton></div></Modal>}
     {modal === 'scheduled-actions' && <Modal title="Scheduled actions" onClose={() => setModal(null)}>{scheduledActions.length ? <div className="scheduled-list">{scheduledActions.map((action) => <article className="note-card scheduled-reminder-card" key={action.id}><div className="note-top"><strong>Reminder to {action.recipientName}</strong><span className={`pill status status-${action.status}`}>{deliveryStatusLabel(action.status)}</span></div><p><strong>Recipient:</strong> {action.recipientEmail}</p><p><strong>Message:</strong> {action.message}</p><div className="note-date"><strong>Scheduled:</strong> {fmtDate(action.scheduledAt, { month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })} · {action.timezone}</div><p><strong>Email:</strong> {action.status === 'sent' || action.status === 'completed' ? `Accepted by provider${action.emailSentAt ? ` · ${fmtDate(action.emailSentAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : ''}` : deliveryStatusLabel(action.status)}</p><p><strong>Acknowledgment:</strong> {action.acknowledgedAt ? `Acknowledged · ${fmtDate(action.acknowledgedAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : 'Not acknowledged'}</p><p><strong>Task:</strong> {action.taskStatus || (action.taskId ? 'Unavailable' : 'No linked task')}</p>{action.failureReason && <p className="failure-reason">{action.failureReason}{action.attemptCount ? ` (attempt ${action.attemptCount})` : ''}</p>}{(action.status === 'scheduled' || action.status === 'failed') && <div className="scheduled-actions-buttons">{action.status === 'scheduled' && <AppButton className="secondary-button" loading={busyAction === `cancel-action-${action.id}`} onClick={() => cancelScheduledAction(action)}>Cancel reminder</AppButton>}<AppButton className="secondary-button" loading={busyAction === `revoke-link-${action.id}`} onClick={() => revokeReminderLink(action)}>Revoke guest link</AppButton></div>}</article>)}</div> : <div className="empty"><strong>No scheduled reminders</strong><span>Create an email reminder from a task's optional details.</span></div>}</Modal>}
     {modal === 'signout-confirm' && <Modal title="Sign out?" onClose={() => setModal(null)}><p className="auth-copy">You can continue using Spectre as a guest on this device.</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => setModal(null)}>Cancel</AppButton><AppButton className="save-task" loading={busyAction === 'sign-out'} onClick={signOut}>{busyAction === 'sign-out' ? 'Signing out…' : 'Sign out'}</AppButton></div></Modal>}
     {modal === 'feedback' && <Modal title={feedback.title} onClose={() => setModal(null)}><p className={`feedback-copy ${feedback.kind}`}>{feedback.message}</p><div className="modal-actions auth-actions"><AppButton className="save-task" onClick={() => setModal(null)}>Done</AppButton></div></Modal>}

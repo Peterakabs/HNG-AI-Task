@@ -59,6 +59,8 @@ export class AppController {
   @Post('notifications/read-all') markAllNotificationsRead(@Req() request: IdentityRequest) { return this.auth.markAllNotificationsRead(this.requireUser(request)); }
 
   @Get('tasks') tasks(@Query() query: Record<string, string>) { return this.service.listTasks(query); }
+  @Get('weekly-summaries') weeklySummaries(@Query('timezone') timezone?: string) { return this.service.listWeeklySummaries(timezone); }
+  @Post('weekly-summaries/:id/viewed') markWeeklySummaryViewed(@Param('id') id: string) { return this.service.markWeeklySummaryViewed(id); }
   @Post('tasks') createTask(@Body() body: Record<string, any>) { return this.service.createTask(body); }
   @Put('tasks/reorder') reorder(@Body('ids') ids: string[]) { return this.service.reorderTasks(ids); }
   @Get('tasks/:id') task(@Param('id') id: string) { return this.service.getTask(id); }

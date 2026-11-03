@@ -218,4 +218,33 @@ html,body,#root{max-width:100%;overflow-x:clip}
   .filters select{font-size:13px}
   .filters .create-tag-btn{grid-column:1/-1}
 }
+.weekly-review{margin:0 0 16px;padding:16px 18px;border:1px solid var(--line);border-radius:16px;background:var(--paper);color:var(--ink)}
+.weekly-review-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.weekly-review-heading h2,.weekly-review-list h3{margin:0;font-size:14px}
+.weekly-review-heading p,.weekly-summary-empty{margin:5px 0 0;color:var(--muted);font-size:12px}
+.weekly-review-heading>strong{color:var(--blue);font-size:13px;white-space:nowrap}
+.weekly-review-list{margin-top:14px}
+.weekly-review-list h3{margin-bottom:8px;color:var(--muted);font-size:12px}
+.weekly-summary-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line)}
+.weekly-summary-label{display:grid;gap:3px}.weekly-summary-label span{font-size:12px;color:var(--muted)}
+.weekly-summary-actions,.weekly-summary-export{display:flex;align-items:center;flex-wrap:wrap;gap:7px}
+.weekly-summary-actions .app-button,.weekly-summary-export .app-button{min-height:36px;padding:0 11px;font-size:12px}
+.modal.weekly-summary-modal{width:min(620px,100%)}
+.weekly-summary-period{margin:0;color:var(--muted);font-size:13px}
+.weekly-summary-intro{margin:12px 0;color:var(--ink);line-height:1.6}
+.weekly-summary-task-list{max-height:42vh;overflow:auto;padding-left:22px}
+.weekly-summary-task-list li{padding:10px 0 10px 3px;border-bottom:1px solid var(--line)}
+.weekly-summary-task-list li strong,.weekly-summary-task-list li span,.weekly-summary-task-list li small{display:block}
+.weekly-summary-task-list li span{margin-top:4px;color:var(--muted)}
+.weekly-summary-task-list li small{margin-top:5px;color:var(--blue)}
+.weekly-summary-export{margin-top:18px;justify-content:flex-end}
+@media(max-width:620px){
+  .weekly-review{padding:14px}
+  .weekly-review-heading{align-items:flex-start;flex-direction:column}
+  .weekly-summary-row{align-items:flex-start;flex-direction:column}
+  .weekly-summary-actions{width:100%}
+  .weekly-summary-actions .app-button{flex:1 1 auto}
+  .weekly-summary-export{display:grid;grid-template-columns:1fr}
+  .weekly-summary-export .app-button{width:100%;min-height:44px}
+}
 @media(prefers-reduced-motion:reduce){.assistant-fab,.assistant-fab-label,.sidebar,.modal,.notes-drawer{transition:none}}
