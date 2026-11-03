@@ -65,7 +65,7 @@ export class AppController {
   @Put('tasks/reorder') reorder(@Body('ids') ids: string[]) { return this.service.reorderTasks(ids); }
   @Get('tasks/:id') task(@Param('id') id: string) { return this.service.getTask(id); }
   @Patch('tasks/:id') updateTask(@Param('id') id: string, @Body() body: Record<string, any>) { return this.service.updateTask(id, body); }
-  @Delete('tasks/:id') deleteTask(@Param('id') id: string) { return this.service.deleteTask(id); }
+  @Delete('tasks/:id') deleteTask(@Param('id') id: string, @Query('series') series?: string) { return this.service.deleteTask(id, series === 'true'); }
 
   @Get('folders') folders() { return this.service.listFolders(); }
   @Post('folders') createFolder(@Body('name') name: string) { return this.service.createFolder(name); }
@@ -80,6 +80,7 @@ export class AppController {
 
   @Get('profile') profile() { return this.service.getProfile(); }
   @Put('profile') updateProfile(@Body() body: Record<string, any>) { return this.service.updateProfile(body); }
+  @Put('auth/password') updatePassword(@Req() request: IdentityRequest, @Body() body: Record<string, any>) { return this.auth.changePassword(this.requireUser(request), body); }
 
   private requireUser(request: IdentityRequest) { if (request.identity?.type !== 'user') throw new UnauthorizedException('Sign in to use scheduled actions.'); return request.identity.id; }
   private setSession(response: Response, session: string) { response.cookie('spectre_session', session, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 24 * 60 * 60 * 1000 }); }

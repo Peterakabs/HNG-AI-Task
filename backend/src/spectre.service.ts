@@ -131,7 +131,7 @@ export class SpectreService {
       emailReminder: Boolean(input.emailReminder),
       folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: input.subtasks || [],
       attachments: input.attachments || [], notes: input.notes?.trim() || '',
-      recurrence: input.recurrence || '', reminder: input.reminder || '', notified: false,
+      recurrence: input.recurrence || '', recurrenceId: input.recurrence ? this.store.id() : undefined, reminder: input.reminder || '', notified: false,
       createdAt: Date.now(), order: data.tasks.length, ...(input.status === 'Completed' ? { completedAt: new Date().toISOString() } : {}), ...(assistantDraftId ? { assistantDraftId } : {}),
     };
     data.tasks.push(task);
@@ -157,19 +157,27 @@ export class SpectreService {
     this.recordTags(data, task.tags);
     let recurringTask: Record<string, any> | undefined;
     if (input.status === 'Completed' && task.recurrence && !wasCompleted) {
-      recurringTask = this.nextOccurrence(task, data.tasks.length);
-      if (recurringTask) data.tasks.push(recurringTask);
+      task.recurrenceId ||= task.id;
+      // A completed occurrence can be reopened and completed again. Keep the
+      // occurrence-to-next-occurrence relationship idempotent across taps.
+      const priorNext = data.tasks.find((item) => item.previousOccurrenceId === task.id);
+      if (!priorNext) {
+        recurringTask = this.nextOccurrence(task, data.tasks.length);
+        if (recurringTask) data.tasks.push(recurringTask);
+      }
     }
     await this.store.write(data);
     return { task, recurringTask };
   }
 
-  async deleteTask(id: string) {
+  async deleteTask(id: string, allOccurrences = false) {
     const data = await this.store.read();
     const task = this.requireTask(data, id);
-    data.tasks = data.tasks.filter((item) => item.id !== id);
+    const seriesId = task.recurrenceId;
+    const deletedCount = allOccurrences && seriesId ? data.tasks.filter((item) => item.recurrenceId === seriesId).length : 1;
+    data.tasks = data.tasks.filter((item) => allOccurrences && seriesId ? item.recurrenceId !== seriesId : item.id !== id);
     await this.store.write(data);
-    return task;
+    return { ...task, deletedCount };
   }
 
   async reorderTasks(ids: string[]) {
@@ -228,10 +236,13 @@ export class SpectreService {
     data.notes = data.notes.filter((item) => item.id !== id); await this.store.write(data); return note;
   }
 
-  async getProfile() { const { username } = await this.store.read(); return { username }; }
+  async getProfile() { const data = await this.store.read(); return { username: data.username, ...(data.phone ? { phone: data.phone } : {}), ...(data.avatarUrl ? { avatarUrl: data.avatarUrl } : {}) }; }
   async updateProfile(input: Record<string, any>) {
     const username = this.requireName(input.username, 'Username');
-    const data = await this.store.read(); data.username = username; await this.store.write(data); return { username };
+    const phone = typeof input.phone === 'string' ? input.phone.trim().slice(0, 40) : undefined;
+    const avatarUrl = typeof input.avatarUrl === 'string' ? input.avatarUrl.trim().slice(0, 2000) : undefined;
+    if (avatarUrl && !/^https:\/\//i.test(avatarUrl)) throw new BadRequestException('Profile image URL must use HTTPS.');
+    const data = await this.store.read(); data.username = username; if (phone !== undefined) data.phone = phone; if (avatarUrl !== undefined) data.avatarUrl = avatarUrl; await this.store.write(data); return { username, ...(data.phone ? { phone: data.phone } : {}), ...(data.avatarUrl ? { avatarUrl: data.avatarUrl } : {}) };
   }
 
   private requireTask(data: SpectreData, id: string) {
@@ -284,6 +295,6 @@ export class SpectreService {
     else return undefined;
     const pad = (n: number) => String(n).padStart(2, '0');
     const due = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-    return { ...task, id: this.store.id(), due, status: 'To Do', completedAt: undefined, createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false })) };
+    return { ...task, id: this.store.id(), recurrenceId: task.recurrenceId || task.id, previousOccurrenceId: task.id, due, status: 'To Do', completedAt: undefined, createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false })) };
   }
 }

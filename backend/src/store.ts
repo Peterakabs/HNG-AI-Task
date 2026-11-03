@@ -19,6 +19,8 @@ export interface SpectreData {
   tags: string[];
   notes: Record<string, any>[];
   username: string;
+  phone?: string;
+  avatarUrl?: string;
 }
 
 @Injectable()
