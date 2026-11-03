@@ -970,7 +970,7 @@ function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpda
     if (!file.type.startsWith('image/')) { setPhotoError('Choose an image file.'); return; }
     if (file.size > 12 * 1024 * 1024) { setPhotoError('Choose an image smaller than 12 MB.'); return; }
     const objectUrl = URL.createObjectURL(file); const image = new Image();
-    image.onload = () => { const size = 400; const side = Math.min(image.naturalWidth, image.naturalHeight); const sx = (image.naturalWidth - side) / 2; const sy = (image.naturalHeight - side) / 2; const canvas = document.createElement('canvas'); canvas.width = size; canvas.height = size; canvas.getContext('2d').drawImage(image, sx, sy, side, side, 0, 0, size, size); URL.revokeObjectURL(objectUrl); setPhotoError(''); onAvatarChange(canvas.toDataURL('image/jpeg', 0.78)); };
+    image.onload = () => { const side = Math.min(image.naturalWidth, image.naturalHeight); const sx = (image.naturalWidth - side) / 2; const sy = (image.naturalHeight - side) / 2; const canvas = document.createElement('canvas'); const context = canvas.getContext('2d'); let size = 256; let quality = 0.68; let data = ''; do { canvas.width = size; canvas.height = size; context.drawImage(image, sx, sy, side, side, 0, 0, size, size); data = canvas.toDataURL('image/jpeg', quality); size = Math.floor(size * 0.8); quality = Math.max(0.45, quality - 0.06); } while (data.length > 90_000 && size >= 128); URL.revokeObjectURL(objectUrl); setPhotoError(''); onAvatarChange(data); };
     image.onerror = () => { URL.revokeObjectURL(objectUrl); setPhotoError('This image could not be opened.'); }; image.src = objectUrl;
   }
   return <section className="profile-page" aria-label="Profile settings">
