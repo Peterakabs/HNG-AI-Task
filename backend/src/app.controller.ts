@@ -104,11 +104,12 @@ export class AppController {
   }
   @Delete('tasks/:id') async deleteTask(@Req() request: IdentityRequest, @Param('id') id: string, @Query('series') series?: string) {
     if (request.identity?.type === 'user') {
-      if (await this.collaboration.sharedTaskForUser(request.identity.id, id)) throw new ForbiddenException('Only the task owner can delete a shared task.');
+      const ownerId = request.identity.id;
+      if (await this.collaboration.sharedTaskForUser(ownerId, id)) throw new ForbiddenException('Only the task owner can delete a shared task.');
       const task = await this.service.getTask(id);
       const cleanupIds = series === 'true' && task.recurrenceId ? (await this.service.listTasks()).filter((item) => item.recurrenceId === task.recurrenceId).map((item) => item.id) : [id];
       const deleted = await this.service.deleteTask(id, series === 'true');
-      await Promise.all(cleanupIds.map((taskId) => this.collaboration.cleanupDeletedTask(request.identity!.id, taskId)));
+      await Promise.all(cleanupIds.map((taskId) => this.collaboration.cleanupDeletedTask(ownerId, taskId)));
       return deleted;
     }
     return this.service.deleteTask(id, series === 'true');

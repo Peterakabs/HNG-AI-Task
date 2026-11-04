@@ -133,7 +133,7 @@ export class CollaborationService {
     if (!owned && !(await this.taskForOwner(ownerId, taskId))) throw new NotFoundException('Task not found.');
     const { data: collaborators, error } = await this.supabase.db.from('task_collaborators').select('id,user_id,permission,joined_at').eq('task_owner_user_id', ownerId).eq('task_id', taskId).order('joined_at');
     if (error) throw new ServiceUnavailableException('Collaborators could not be loaded. Please try again.');
-    const people = [await this.person(ownerId, 'owner')];
+    const people: Array<{ userId: string; username: string; avatarUrl?: string; permission: string; id?: string; joinedAt?: string }> = [await this.person(ownerId, 'owner')];
     for (const item of collaborators || []) people.push({ ...(await this.person(item.user_id, item.permission)), id: item.id, joinedAt: item.joined_at });
     let invitations: any[] = [];
     if (isOwner) {
