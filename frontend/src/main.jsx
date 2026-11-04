@@ -229,6 +229,7 @@ function App() {
   const [profileDraft, setProfileDraft] = useState({ username: '', phone: '', avatarUrl: '' });
   const [deleteTarget, setDeleteTarget] = useState(null);
   const toggleRequests = useRef(new Set());
+  const googleSigninCompletionRef = useRef('idle');
   const [passwordResetEmail, setPasswordResetEmail] = useState('');
   const [passwordResetPassword, setPasswordResetPassword] = useState('');
   const [passwordResetToken, setPasswordResetToken] = useState(getPasswordResetToken);
@@ -346,19 +347,26 @@ function App() {
   }, [reload, showFeedback]);
   useEffect(() => {
     if (!googleAuth || loading) return undefined;
-    const completeGoogleFlow = async () => {
-      const intent = sessionStorage.getItem('spectre.google.intent');
-      if (!intent) return;
-      sessionStorage.removeItem('spectre.google.intent');
-      if (intent !== 'signin') return;
+    const intent = sessionStorage.getItem('spectre.google.intent');
+    if (intent !== 'signin') return undefined;
+    const completeGoogleFlow = async (callbackSession) => {
+      if (googleSigninCompletionRef.current !== 'idle' || sessionStorage.getItem('spectre.google.intent') !== 'signin') return;
+      googleSigninCompletionRef.current = 'processing';
       try {
-        const { data, error } = await googleAuth.auth.getSession();
-        if (error) throw error;
-        const session = data.session;
-        if (!session) throw new Error('Google sign-in did not finish. Please try again.');
+        let session = callbackSession;
+        if (!session) {
+          const { data, error } = await googleAuth.auth.getSession();
+          if (error) throw error;
+          session = data.session;
+        }
+        // Supabase can still be exchanging Google's callback code on the first
+        // read. Keep the intent and let onAuthStateChange complete the flow.
+        if (!session) { googleSigninCompletionRef.current = 'idle'; return; }
         const identity = session.user?.identities?.some((item) => item.provider === 'google') || session.user?.app_metadata?.provider === 'google';
         if (!identity) throw new Error('The Google identity could not be verified. Please try again.');
         const user = await api('/auth/google/session', { method: 'POST', body: { accessToken: session.access_token, refreshToken: session.refresh_token } });
+        googleSigninCompletionRef.current = 'complete';
+        sessionStorage.removeItem('spectre.google.intent');
         // The backend now owns the app session. Clear the temporary OAuth session
         // so a later sign-in starts cleanly and can select a different Google user.
         try { await googleAuth.auth.signOut({ scope: 'local' }); } catch { /* The verified backend session is already established. */ }
@@ -372,12 +380,16 @@ function App() {
         sessionStorage.removeItem('spectre-google-oauth-session');
         sessionStorage.removeItem('spectre-google-oauth-session-code-verifier');
       } catch (err) {
+        googleSigninCompletionRef.current = 'idle';
         sessionStorage.removeItem('spectre.google.intent');
         showFeedback('error', err.message || 'Google authentication failed.');
       }
     };
-    completeGoogleFlow();
-    return undefined;
+    const { data: { subscription } } = googleAuth.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION') void completeGoogleFlow(session);
+    });
+    void completeGoogleFlow();
+    return () => subscription.unsubscribe();
   }, [reload, showFeedback, notify, loading]);
   useEffect(() => {
     if (!authUser || !googleCalendarStatus.connected || view !== 'calendar') { setGoogleCalendarEvents([]); return undefined; }
@@ -548,6 +560,7 @@ function App() {
     setBusyAction('google-auth');
     try {
       const client = requireGoogleAuth();
+      googleSigninCompletionRef.current = 'idle';
       sessionStorage.setItem('spectre.google.intent', 'signin');
       const { error } = await client.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin, scopes: 'openid email profile', queryParams: { prompt: 'select_account' } } });
       if (error) throw error;
