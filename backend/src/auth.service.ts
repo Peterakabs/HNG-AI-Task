@@ -1,4 +1,4 @@
-import { BadRequestException, HttpException, Injectable, Logger, NestMiddleware, NotFoundException, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, HttpException, Injectable, Logger, NestMiddleware, NotFoundException, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import { SupabaseStore, ScopeContext } from './store';
@@ -137,6 +137,21 @@ export class AuthService {
     if (!(await this.getUser(userId))) throw new UnauthorizedException('Authenticated account not found.');
     const guest = await this.getGuestAccount(guestUserId);
     if (!guest) throw new BadRequestException('The guest account is no longer available.');
+    const { data: claim, error: claimError } = await this.supabase.db.from('guest_accounts')
+      .update({ transferred_to_user_id: userId })
+      .eq('id', guestUserId)
+      .or(`transferred_to_user_id.is.null,transferred_to_user_id.eq.${userId}`)
+      .select('id')
+      .maybeSingle();
+    if (claimError) throw new ServiceUnavailableException('Guest tasks could not be linked to this account. Please try again.');
+    if (!claim) {
+      const { data: existingClaim, error: lookupError } = await this.supabase.db.from('guest_accounts').select('transferred_to_user_id').eq('id', guestUserId).maybeSingle();
+      if (lookupError) throw new ServiceUnavailableException('Guest account ownership could not be checked. Please try again.');
+      if (existingClaim?.transferred_to_user_id && existingClaim.transferred_to_user_id !== userId) {
+        throw new ConflictException('These guest tasks were already transferred to another account. Sign in to that account to access them.');
+      }
+      throw new BadRequestException('The guest account is no longer available. Refresh the app and try again.');
+    }
     const source = await this.store.read(`guest:${guest.device_id}`);
     const destination = await this.store.read(`user:${userId}`);
     const taskFingerprint = (task: Record<string, any>) => `${String(task.title || '').trim().toLowerCase()}\u0000${task.start || ''}\u0000${task.due || ''}`;

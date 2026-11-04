@@ -61,6 +61,8 @@ describe('AuthService (Supabase integration boundary)', () => {
   });
 
   it('preserves account data and deduplicates guest tasks only after explicit transfer confirmation', async () => {
+    const claimQuery = { eq: jest.fn().mockReturnThis(), or: jest.fn().mockReturnThis(), select: jest.fn().mockReturnThis(), maybeSingle: jest.fn().mockResolvedValue({ data: { id: 'guest-1' }, error: null }) };
+    supabase.db.from = jest.fn(() => ({ update: jest.fn(() => claimQuery) }));
     const guestState: SpectreData = { tasks: [{ id: 'guest-1', title: 'Only guest', start: '2026-10-01', due: '2026-10-02T10:00' }, { id: 'guest-2', title: 'Existing', start: '2026-10-01', due: '2026-10-02T11:00' }], folders: ['Home'], tags: ['Planning'], notes: [], username: 'Guest' };
     const userState: SpectreData = { tasks: [{ id: 'account-copy', title: 'Existing', start: '2026-10-01', due: '2026-10-02T11:00', status: 'In Progress' }], folders: [], tags: [], notes: [], username: 'Account' };
     rows.set('guest:device-1', guestState); rows.set('user:user-1', userState);

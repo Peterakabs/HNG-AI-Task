@@ -40,6 +40,7 @@ const userFacingApiError = (message, status) => {
   if (/valid email address/i.test(raw)) return 'Enter a valid email address.';
   if (/folder already exists/i.test(raw)) return 'A folder with that name already exists.';
   if (/tag already exists/i.test(raw)) return 'A tag with that name already exists.';
+  if (/guest tasks were already transferred to another account/i.test(raw)) return 'These device tasks are already linked to another account. Sign in to that account to access them.';
   if (/note text (?:is required|cannot be empty)/i.test(raw)) return 'Add some text to your note before saving.';
   if (/file too large|image smaller than 5 mb/i.test(raw) || status === 413) return 'Choose a JPG, PNG, or WebP image smaller than 5 MB.';
   if (/use a valid jpg|choose a jpg, png, or webp/i.test(raw)) return 'Choose a valid JPG, PNG, or WebP image.';
@@ -1349,6 +1350,15 @@ function VoiceTextArea({ value, onChange, format = 'bullets', dictationRef, ...p
   return <div className="voice-note-field"><textarea {...props} value={value} onChange={(event) => { valueRef.current = event.target.value; onChange(event.target.value); }} /><div className="voice-note-controls"><AppButton type="button" className={`voice-note-button ${listening ? 'listening' : ''}`} aria-label={listening ? 'Stop dictation' : 'Dictate note'} title={listening ? 'Stop dictation' : 'Dictate note'} onClick={toggleVoice}>{listening ? <span aria-hidden="true">■</span> : <svg className="voice-mic-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.8"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>}<span>{listening ? 'Stop dictation' : 'Dictate lecture'}</span></AppButton>{listening && <span className="dictation-live"><i /> Recording — tap Stop when finished</span>}{unavailable && <small>Voice typing is not available in this browser. You can type your note instead.</small>}{interim && <small>Hearing: {interim}</small>}</div></div>;
 }
 
+function profilePhotoSource(source) {
+  if (!source) return source;
+  try {
+    const url = new URL(source, window.location.origin);
+    if (url.hostname.endsWith('googleusercontent.com')) url.pathname = url.pathname.replace(/=s\d+(?:-c)?$/, '=s768-c');
+    return /^https?:/.test(source) ? url.toString() : source;
+  } catch { return source; }
+}
+
 function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpdate, onPasswordUpdate, onAvatarChange, busyAction, googleCalendarStatus, onConnectCalendar, onDisconnectCalendar, onSignIn, onSwitchAccount }) {
   const [photoError, setPhotoError] = useState('');
   const [photoSuccess, setPhotoSuccess] = useState('');
@@ -1357,7 +1367,7 @@ function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpda
   const [selectedPhoto, setSelectedPhoto] = useState(null);
   const [previewUrl, setPreviewUrl] = useState('');
   const photoInput = useRef(null);
-  const avatar = profileDraft.avatarUrl || authUser?.avatarUrl;
+  const avatar = profilePhotoSource(profileDraft.avatarUrl || authUser?.avatarUrl);
   useEffect(() => { if (!selectedPhoto) { setPreviewUrl(''); return undefined; } const url = URL.createObjectURL(selectedPhoto); setPreviewUrl(url); return () => URL.revokeObjectURL(url); }, [selectedPhoto]);
   function choosePhoto() {
     setPhotoError(''); setPhotoSuccess('');
