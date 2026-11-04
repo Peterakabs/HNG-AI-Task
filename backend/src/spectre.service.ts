@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { SupabaseStore, SpectreData } from './store';
 
 const priorities = ['High', 'Medium', 'Low'];
@@ -129,7 +130,7 @@ export class SpectreService {
       id: this.store.id(), title: input.title.trim(), description: input.description?.trim() || '',
       start: typeof input.start === 'string' && input.start ? input.start : input.due.slice(0, 10), due: input.due, status: input.status, priority: input.priority,
       emailReminder: Boolean(input.emailReminder),
-      folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: input.subtasks || [],
+      folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: this.normalizeSubtasks(input.subtasks || [], [], undefined),
       attachments: input.attachments || [], notes: input.notes?.trim() || '',
       recurrence: input.recurrence || '', recurrenceId: input.recurrence ? this.store.id() : undefined, reminder: input.reminder || '', notified: false,
       createdAt: Date.now(), order: data.tasks.length, ...(input.status === 'Completed' ? { completedAt: new Date().toISOString() } : {}), ...(assistantDraftId ? { assistantDraftId } : {}),
@@ -140,13 +141,14 @@ export class SpectreService {
     return task;
   }
 
-  async getTask(id: string) { return this.requireTask(await this.store.read(), id); }
+  async getTask(id: string, scope?: string) { return this.requireTask(await this.store.read(scope), id); }
 
-  async updateTask(id: string, input: Record<string, any>) {
-    const data = await this.store.read();
+  async updateTask(id: string, input: Record<string, any>, scope?: string, actorUserId?: string) {
+    const data = await this.store.read(scope);
     const task = this.requireTask(data, id);
     const wasCompleted = task.status === 'Completed';
     const merged = { ...task, ...input };
+    if (Array.isArray(input.subtasks)) merged.subtasks = this.normalizeSubtasks(input.subtasks, task.subtasks || [], actorUserId);
     this.validateTask(merged, true);
     Object.assign(task, merged, {
       title: merged.title.trim(), description: merged.description?.trim() || '',
@@ -166,17 +168,31 @@ export class SpectreService {
         if (recurringTask) data.tasks.push(recurringTask);
       }
     }
-    await this.store.write(data);
+    await this.store.write(data, scope);
     return { task, recurringTask };
   }
 
-  async deleteTask(id: string, allOccurrences = false) {
-    const data = await this.store.read();
+  private normalizeSubtasks(items: Record<string, any>[], previous: Record<string, any>[], actorUserId?: string) {
+    const normalized = items.map((item, index) => {
+      if (!item || typeof item !== 'object' || typeof item.text !== 'string' || !item.text.trim() || item.text.length > 500) throw new BadRequestException('Each checklist item needs text between 1 and 500 characters.');
+      const old = (item.id && previous.find((entry) => entry.id === item.id)) || previous[index];
+      const isCompleted = Boolean(item.is_completed ?? item.done);
+      const wasCompleted = Boolean(old?.is_completed ?? old?.done);
+      const completedAt = isCompleted ? (!wasCompleted || !old?.completed_at ? new Date().toISOString() : old.completed_at) : null;
+      const completedBy = isCompleted ? (!wasCompleted || !old?.completed_by ? (actorUserId || null) : old.completed_by) : null;
+      return { ...item, text: item.text.trim(), id: typeof item.id === 'string' && item.id ? item.id : old?.id || randomUUID(), is_completed: isCompleted, done: isCompleted, completed_at: completedAt, completed_by: completedBy };
+    });
+    if (new Set(normalized.map((item) => item.id)).size !== normalized.length) throw new BadRequestException('Checklist items must have unique identifiers.');
+    return normalized;
+  }
+
+  async deleteTask(id: string, allOccurrences = false, scope?: string) {
+    const data = await this.store.read(scope);
     const task = this.requireTask(data, id);
     const seriesId = task.recurrenceId;
     const deletedCount = allOccurrences && seriesId ? data.tasks.filter((item) => item.recurrenceId === seriesId).length : 1;
     data.tasks = data.tasks.filter((item) => allOccurrences && seriesId ? item.recurrenceId !== seriesId : item.id !== id);
-    await this.store.write(data);
+    await this.store.write(data, scope);
     return { ...task, deletedCount };
   }
 
@@ -245,13 +261,15 @@ export class SpectreService {
     data.notes = data.notes.filter((item) => item.id !== id); await this.store.write(data); return note;
   }
 
-  async getProfile() { const data = await this.store.read(); return { username: data.username, ...(data.phone ? { phone: data.phone } : {}), ...(data.avatarUrl ? { avatarUrl: data.avatarUrl } : {}) }; }
+  async getProfile() { const data = await this.store.read(); return { username: data.username, ...(data.phone ? { phone: data.phone } : {}) }; }
   async updateProfile(input: Record<string, any>) {
     const username = this.requireName(input.username, 'Username');
     const phone = typeof input.phone === 'string' ? input.phone.trim().slice(0, 40) : undefined;
-    const avatarUrl = typeof input.avatarUrl === 'string' ? input.avatarUrl.trim().slice(0, 800_000) : undefined;
-    if (avatarUrl && !/^https:\/\//i.test(avatarUrl) && !/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(avatarUrl)) throw new BadRequestException('Choose a valid HTTPS image or upload a JPG, PNG, or WebP image.');
-    const data = await this.store.read(); data.username = username; if (phone !== undefined) data.phone = phone; if (avatarUrl !== undefined) data.avatarUrl = avatarUrl; await this.store.write(data); return { username, ...(data.phone ? { phone: data.phone } : {}), ...(data.avatarUrl ? { avatarUrl: data.avatarUrl } : {}) };
+    const data = await this.store.read(); data.username = username; if (phone !== undefined) data.phone = phone;
+    // Older versions stored image data directly in the JSON profile. Stop
+    // accepting that representation and remove it when the profile is saved.
+    delete data.avatarUrl;
+    await this.store.write(data); return { username, ...(data.phone ? { phone: data.phone } : {}) };
   }
 
   private requireTask(data: SpectreData, id: string) {
@@ -304,6 +322,6 @@ export class SpectreService {
     else return undefined;
     const pad = (n: number) => String(n).padStart(2, '0');
     const due = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-    return { ...task, id: this.store.id(), recurrenceId: task.recurrenceId || task.id, previousOccurrenceId: task.id, due, status: 'To Do', completedAt: undefined, createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false })) };
+    return { ...task, id: this.store.id(), recurrenceId: task.recurrenceId || task.id, previousOccurrenceId: task.id, due, status: 'To Do', completedAt: undefined, createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false, is_completed: false, completed_at: null, completed_by: null })) };
   }
 }

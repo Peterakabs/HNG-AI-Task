@@ -57,6 +57,26 @@ describe('SpectreService (unit)', () => {
     expect(second.recurringTask).toBeUndefined(); expect(await service.listTasks()).toHaveLength(2);
   });
 
+  it('persists checklist completion metadata independently from parent task status', async () => {
+    const task = await service.createTask(validTask({ subtasks: [{ text: 'Read chapter' }, { text: 'Write notes' }] }));
+    const actor = randomUUID();
+    const marked = await service.updateTask(task.id, { subtasks: task.subtasks.map((item, index) => index ? item : { ...item, done: true }) }, undefined, actor);
+    expect(marked.task.status).toBe('To Do');
+    expect(marked.task.subtasks[0]).toMatchObject({ done: true, is_completed: true, completed_by: actor });
+    expect(marked.task.subtasks[0].completed_at).toEqual(expect.any(String));
+    expect(marked.task.subtasks[1]).toMatchObject({ done: false, is_completed: false, completed_at: null, completed_by: null });
+
+    const unchecked = await service.updateTask(task.id, { subtasks: marked.task.subtasks.map((item, index) => index ? item : { ...item, done: false }) }, undefined, actor);
+    expect(unchecked.task.status).toBe('To Do');
+    expect(unchecked.task.subtasks[0]).toMatchObject({ done: false, is_completed: false, completed_at: null, completed_by: null });
+  });
+
+  it('resets recurring checklist completion state on the next occurrence', async () => {
+    const task = await service.createTask(validTask({ recurrence: 'Weekly', subtasks: [{ text: 'Prepare', done: true }] }));
+    const completed = await service.updateTask(task.id, { status: 'Completed' });
+    expect(completed.recurringTask?.subtasks[0]).toMatchObject({ done: false, is_completed: false, completed_at: null, completed_by: null });
+  });
+
   it('reorders tasks and rejects duplicate ids', async () => {
     const first = await service.createTask(validTask({ title: 'First' }));
     const second = await service.createTask(validTask({ title: 'Second' }));

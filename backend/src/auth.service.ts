@@ -6,7 +6,7 @@ import { SupabaseService } from './supabase.service';
 
 type SessionCookie = { access_token: string; refresh_token: string };
 type GuestAccount = { id: string; device_id: string; created_at: string };
-export type RequestIdentity = { type: 'user'; id: string; email?: string } | { type: 'guest'; deviceId: string; guestUserId?: string };
+export type RequestIdentity = { type: 'user'; id: string; email?: string; emailVerified?: boolean } | { type: 'guest'; deviceId: string; guestUserId?: string };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Injectable()
@@ -31,7 +31,7 @@ export class AuthService {
       refreshed = { access_token: result.data.session.access_token, refresh_token: result.data.session.refresh_token };
     }
     if (!data.user) throw new UnauthorizedException('This account session is no longer valid. Please log in again.');
-    return { identity: { type: 'user' as const, id: data.user.id, email: data.user.email }, session: refreshed && this.encodeSession(refreshed) };
+    return { identity: { type: 'user' as const, id: data.user.id, email: data.user.email, emailVerified: this.isEmailVerified(data.user) }, session: refreshed && this.encodeSession(refreshed) };
   }
 
   createGuestIdentity(value: unknown): Extract<RequestIdentity, { type: 'guest' }> {
@@ -388,7 +388,12 @@ export class AuthService {
     if (process.env.NODE_ENV === 'production' && !process.env.APP_URL?.trim()) missing.push('APP_URL');
     return missing;
   }
-  private publicUser(user: { id: string; email?: string; created_at?: string; updated_at?: string; user_metadata?: Record<string, any> }) { return { id: user.id, email: user.email, avatarUrl: typeof user.user_metadata?.avatar_url === 'string' ? user.user_metadata.avatar_url : undefined, displayName: typeof user.user_metadata?.full_name === 'string' ? user.user_metadata.full_name : undefined, createdAt: user.created_at ? Date.parse(user.created_at) : Date.now(), updatedAt: user.updated_at ? Date.parse(user.updated_at) : Date.now() }; }
+  private publicUser(user: { id: string; email?: string; created_at?: string; updated_at?: string; email_confirmed_at?: string; identities?: Array<{ provider?: string; identity_data?: Record<string, any> }>; app_metadata?: Record<string, any>; user_metadata?: Record<string, any> }) { return { id: user.id, email: user.email, emailVerified: this.isEmailVerified(user), avatarUrl: typeof user.user_metadata?.avatar_url === 'string' ? user.user_metadata.avatar_url : undefined, displayName: typeof user.user_metadata?.full_name === 'string' ? user.user_metadata.full_name : undefined, createdAt: user.created_at ? Date.parse(user.created_at) : Date.now(), updatedAt: user.updated_at ? Date.parse(user.updated_at) : Date.now() }; }
+  private isEmailVerified(user: { email_confirmed_at?: string; identities?: Array<{ provider?: string; identity_data?: Record<string, any> }>; app_metadata?: Record<string, any>; user_metadata?: Record<string, any> }) {
+    if (user.email_confirmed_at) return true;
+    const google = user.identities?.find((identity) => identity.provider === 'google');
+    return google?.identity_data?.email_verified === true || user.user_metadata?.email_verified === true;
+  }
   private cleanEmail(value: unknown) { if (typeof value !== 'string' || value.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())) throw new BadRequestException('A valid email address is required.'); return value.trim().toLowerCase(); }
   private cleanPassword(value: unknown, enforce = true) { if (typeof value !== 'string' || (enforce && value.length < 8) || value.length > 256) throw new BadRequestException(enforce ? 'Password must be between 8 and 256 characters.' : 'Password is required.'); return value; }
   private required(value: unknown, label: string) { if (typeof value !== 'string' || !value.trim() || value.length > 2000) throw new BadRequestException(`${label} is required.`); return value.trim(); }
