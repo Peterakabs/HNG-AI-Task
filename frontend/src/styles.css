@@ -369,3 +369,20 @@ html[data-theme="dark"] .cal-google-event{background:#183625;color:#ace5b6}
 .tag-delete:hover{background:#feecec;color:#c63f3f}
 
 .external-reminder-setting{display:grid;gap:12px}.reminder-methods{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.reminder-method.app-button{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-rows:auto auto;align-items:center;gap:5px 10px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);text-align:left;opacity:.78;cursor:not-allowed}.reminder-method-icon{grid-row:1/3;font-size:19px;color:var(--blue)}.reminder-method-copy{display:grid;gap:3px}.reminder-method-copy strong{font-size:12px}.reminder-method-copy small{font-size:10px;line-height:1.4;color:var(--muted)}.coming-soon-badge{grid-column:2;justify-self:start;padding:3px 7px;border-radius:999px;background:var(--soft);color:var(--muted);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}@media(max-width:520px){.reminder-methods{grid-template-columns:1fr}}
+
+/* Clear touch targets, comfortable mobile gutters, and readable inline content. */
+.task:focus-within .task-quick{opacity:1}@media(hover:none){.task-quick{opacity:1}}@media(max-width:680px){.center{padding-left:18px;padding-right:18px}.modal{padding-left:20px;padding-right:20px}.cal-day{padding-left:6px;padding-right:6px}}@media(max-width:380px){.center{padding-left:16px;padding-right:16px}}.optional-hint{margin:10px 2px 0;line-height:1.55}.auth-copy,.feedback-copy,.field-hint{padding-left:2px;padding-right:2px;overflow-wrap:anywhere}.cal-google-event-static,.google-event-static{cursor:default;pointer-events:none}.cal-google-event-static:hover,.google-event-static:hover{overflow:hidden;z-index:auto}.app-button:focus-visible{outline:3px solid color-mix(in srgb,var(--blue) 35%,transparent);outline-offset:2px}
+
+/* Keep text comfortably inset inside dense cards and inline content. */
+.progress-copy,.task-body,.weekly-summary-label,.profile-overview>div{padding-inline:4px}
+.task-meta,.note-card p,.weekly-summary-intro,.weekly-summary-empty,.empty>span,.detail-description{padding-inline:6px}
+.google-event-agenda>span:nth-child(2),.calendar-conflict-item span,.assistant-message p{padding-inline:4px}
+.task-title,.task-desc,.progress-title,.progress-sub,.note-card p,.weekly-summary-label span,.detail-description{overflow-wrap:anywhere}
+@media(max-width:680px){
+  .progress-copy,.task-body,.weekly-summary-label,.profile-overview>div,.task-meta,.note-card p,.weekly-summary-intro,.weekly-summary-empty,.empty>span,.detail-description,.google-event-agenda>span:nth-child(2),.calendar-conflict-item span,.assistant-message p{padding-inline:7px}
+}
+@media(max-width:380px){
+  .center{padding-left:16px;padding-right:16px}
+  .modal{padding-left:18px;padding-right:18px}
+  .progress-copy,.task-body,.weekly-summary-label,.profile-overview>div,.task-meta,.note-card p,.weekly-summary-intro,.weekly-summary-empty,.empty>span,.detail-description,.google-event-agenda>span:nth-child(2),.calendar-conflict-item span,.assistant-message p{padding-inline:5px}
+}
