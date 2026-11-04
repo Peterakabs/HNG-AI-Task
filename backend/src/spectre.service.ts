@@ -127,7 +127,7 @@ export class SpectreService {
     }
     const task = {
       id: this.store.id(), title: input.title.trim(), description: input.description?.trim() || '',
-      start: input.start, due: input.due, status: input.status, priority: input.priority,
+      start: typeof input.start === 'string' && input.start ? input.start : input.due.slice(0, 10), due: input.due, status: input.status, priority: input.priority,
       emailReminder: Boolean(input.emailReminder),
       folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: input.subtasks || [],
       attachments: input.attachments || [], notes: input.notes?.trim() || '',
@@ -292,7 +292,7 @@ export class SpectreService {
     if (!statuses.includes(task.status)) throw new BadRequestException('Status must be To Do, Pending, Acknowledged, In Progress, or Completed.');
     if (['Pending', 'Acknowledged'].includes(task.status) && !task.emailReminder) throw new BadRequestException('Pending and Acknowledged are only valid for tasks with an external email reminder.');
     if (!priorities.includes(task.priority)) throw new BadRequestException('Priority must be High, Medium, or Low.');
-    if (typeof task.start !== 'string' || !task.start || Number.isNaN(Date.parse(task.start))) throw new BadRequestException('A valid start date is required.');
+    if (task.start !== undefined && task.start !== null && task.start !== '' && (typeof task.start !== 'string' || Number.isNaN(Date.parse(task.start)))) throw new BadRequestException('Start date must be valid when provided.');
     if (typeof task.due !== 'string' || !task.due || Number.isNaN(Date.parse(task.due))) throw new BadRequestException('A valid due date and time is required.');
     if (!Array.isArray(task.subtasks || []) || !Array.isArray(task.attachments || []) || !Array.isArray(task.tags || [])) throw new BadRequestException('Tags, subtasks, and attachments must be arrays.');
   }
