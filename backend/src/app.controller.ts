@@ -25,9 +25,10 @@ export class AppController {
   }
   @Post('auth/logout') async logout(@Req() request: IdentityRequest, @Res({ passthrough: true }) response: Response) { await this.auth.logout(request.headers.cookie); response.clearCookie('spectre_session', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', path: '/' }); return { status: 'ok' }; }
   @Get('auth/me') me(@Req() request: IdentityRequest) { return request.identity?.type === 'user' ? this.auth.getUser(request.identity.id) : null; }
-  @Post('auth/google/session') async googleSession(@Body() body: Record<string, any>, @Req() request: IdentityRequest, @Res({ passthrough: true }) response: Response) {
+  @Post('auth/google/session') async googleSession(@Body() body: Record<string, any>, @Res({ passthrough: true }) response: Response) {
     const result = await this.auth.exchangeGoogleSession(body);
-    if (request.identity?.type === 'user' && request.identity.id !== result.user.id) throw new UnauthorizedException('Google returned a different account than the one currently signed in.');
+    // This endpoint is a sign-in endpoint: a verified Google identity should replace
+    // any previous Spectre session, just like a successful email/password login.
     this.setSession(response, result.session); return result.user;
   }
   @Get('auth/google/link-session') async googleLinkSession(@Req() request: IdentityRequest, @Res({ passthrough: true }) response: Response) {
