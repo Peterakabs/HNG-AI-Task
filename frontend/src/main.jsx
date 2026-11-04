@@ -241,6 +241,8 @@ function App() {
   const [profileDraft, setProfileDraft] = useState({ username: '', phone: '', avatarUrl: '' });
   const [deleteTarget, setDeleteTarget] = useState(null);
   const toggleRequests = useRef(new Set());
+  const reloadRequestRef = useRef(0);
+  const loadedIdentityRef = useRef(null);
   const googleSigninCompletionRef = useRef('idle');
   const [passwordResetEmail, setPasswordResetEmail] = useState('');
   const [passwordResetPassword, setPasswordResetPassword] = useState('');
@@ -303,31 +305,46 @@ function App() {
   }, []);
 
   const reload = useCallback(async () => {
+    const requestId = ++reloadRequestRef.current;
     try {
       const user = await api('/auth/me');
+      if (requestId !== reloadRequestRef.current) return;
       if (!user) await resolveGuestAccount();
+      const identityKey = user ? `user:${user.id}` : `guest:${getDeviceId()}`;
+      if (loadedIdentityRef.current !== identityKey) {
+        loadedIdentityRef.current = identityKey;
+        setLoading(true);
+        setTasks([]); setSharedTasks([]); setFolders([]); setTags([]); setNotes([]); setWeeklySummaries([]);
+        setNotifications([]); setUnreadNotificationCount(0); setScheduledActions([]); setGoogleCalendarEvents([]);
+        setGoogleCalendarStatus({ connected: false, email: null }); setSelectedTask(null); setUsername('User1000');
+        setProfileDraft({ username: '', phone: '', avatarUrl: '' });
+        sessionStorage.removeItem('spectre.voice-assistant-session');
+      }
       const [nextTasks, nextFolders, nextTags, nextNotes, profile] = await Promise.all([
         api('/tasks'), api('/folders'), api('/tags'), api('/notes'), api('/profile'),
       ]);
+      if (requestId !== reloadRequestRef.current) return;
       if (![nextTasks, nextFolders, nextTags, nextNotes].every(Array.isArray) || !profile?.username) throw new Error('The API returned an unexpected response. Restart the updated NestJS server and try again.');
       setTasks(nextTasks); setFolders(nextFolders); setTags(nextTags); setNotes(nextNotes);
       setUsername(profile.username); setProfileDraft({ username: profile.username, phone: profile.phone || '', avatarUrl: profile.avatarUrl || '' }); setAuthUser(user); setError('');
       try {
         const summaries = await api(`/weekly-summaries?timezone=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`);
+        if (requestId !== reloadRequestRef.current) return;
         if (Array.isArray(summaries)) {
           setWeeklySummaries(summaries);
           const activeTasks = await api('/tasks');
+          if (requestId !== reloadRequestRef.current) return;
           if (Array.isArray(activeTasks)) setTasks(activeTasks);
         }
       } catch (summaryError) { console.warn('[Spectre] Could not refresh weekly summaries:', summaryError.message); }
       if (user) {
-        try { const result = await api('/notifications'); setNotifications(result.notifications || []); setUnreadNotificationCount(result.unreadCount || 0); }
+        try { const result = await api('/notifications'); if (requestId === reloadRequestRef.current) { setNotifications(result.notifications || []); setUnreadNotificationCount(result.unreadCount || 0); } }
         catch (notificationError) { console.warn('[Spectre] Could not load notifications:', notificationError.message); }
-        try { setGoogleCalendarStatus(await api('/google-calendar/status')); }
+        try { const status = await api('/google-calendar/status'); if (requestId === reloadRequestRef.current) setGoogleCalendarStatus(status); }
         catch (calendarError) { console.warn('[Spectre] Could not load Google Calendar status:', calendarError.message); setGoogleCalendarStatus({ connected: false, email: null }); }
       } else { setNotifications([]); setUnreadNotificationCount(0); setGoogleCalendarStatus({ connected: false, email: null }); setGoogleCalendarEvents([]); }
-    } catch (err) { setError(err.message); }
-    finally { setLoading(false); }
+    } catch (err) { if (requestId === reloadRequestRef.current) setError(err.message); }
+    finally { if (requestId === reloadRequestRef.current) setLoading(false); }
   }, []);
 
   useEffect(() => { reload(); }, [reload]);
@@ -574,11 +591,13 @@ function App() {
   }
   async function authenticate(event) {
     event.preventDefault();
+    reloadRequestRef.current += 1;
     setBusyAction('auth');
     try {
       const user = await api(`/auth/${authMode === 'signup' ? 'signup' : 'login'}`, { method: 'POST', body: authDraft });
       const hasGuestData = tasks.length > 0 || notes.length > 0 || tags.length > 0 || folders.some((folder) => !['Personal', 'Work'].includes(folder));
       if (hasGuestData) setGuestTransferSummary({ tasks: tasks.length, notes: notes.length });
+      setLoading(true);
       setAuthUser(user); setAuthDraft({ email: '', password: '' });
       if (hasGuestData) setModal('guest-transfer');
       else if (collaborationToken) setModal(null);
@@ -749,6 +768,8 @@ function App() {
     catch (err) { showFeedback('error', err.message); }
   }
   async function signOut(switchAccount = false) {
+    reloadRequestRef.current += 1;
+    setLoading(true);
     setBusyAction('sign-out');
     try {
       await api('/auth/logout', { method: 'POST' });
@@ -758,7 +779,7 @@ function App() {
       await reload();
       if (switchAccount) { setAuthMode('login'); setModal('auth'); }
       else { setFeedback({ kind: 'success', title: 'Signed out', message: 'You have been signed out successfully. Your tasks are still available as a guest on this device.' }); setModal('feedback'); }
-    } catch (err) { setFeedback({ kind: 'error', title: 'Sign out failed', message: userFacingFeedback(err.message) }); setModal('feedback'); }
+    } catch (err) { setLoading(false); setFeedback({ kind: 'error', title: 'Sign out failed', message: userFacingFeedback(err.message) }); setModal('feedback'); }
     finally { setBusyAction(''); }
   }
   async function toggleTask(task) {
@@ -1262,13 +1283,13 @@ function TaskDetail({ task, authUser, onInvite, onClose, onEdit, onToggle, onSub
   const completed = items.filter((item) => Boolean(item.is_completed ?? item.done)).length;
   const percent = items.length ? Math.round(completed / items.length * 100) : 0;
   const canEdit = !task.shared || task.sharedPermission === 'editor';
-  return <div className="detail-page-backdrop" role="presentation"><article className="detail-page"><div className="detail-page-header"><AppButton className="secondary-button" onClick={onClose}>← Back</AppButton><div>{canEdit && <AppButton className="secondary-button" loading={toggling} onClick={onToggle}>{toggling ? 'Updating…' : task.status === 'Completed' ? 'Mark incomplete' : 'Mark complete'}</AppButton>}{!task.shared && authUser && <AppButton className="secondary-button" onClick={() => onInvite(task)}>Share task</AppButton>}{canEdit && <AppButton className="secondary-button" onClick={onEdit}>Edit task</AppButton>}<AppButton className="close" aria-label="Close task details" onClick={onClose}>×</AppButton></div></div>{task.shared && <div className="shared-task-banner">Shared with you · {task.sharedPermission === 'editor' ? 'You can make changes' : 'View only'}</div>}<div className="detail-kicker">{task.status} · {task.priority}</div><h1>{task.title}</h1>{task.description && <p className="detail-description">{task.description}</p>}<div className="detail-grid">{task.start && <div><small>Start date</small><strong>{fmtDate(task.start, { year: 'numeric', month: 'long', day: 'numeric' })}</strong></div>}{task.due && <div><small>Due</small><strong>{fmtDate(task.due, { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</strong></div>}{task.folder && <div><small>Folder</small><strong>{task.folder}</strong></div>}{task.recurrence && <div><small>Repeat</small><strong>{task.recurrence}</strong></div>}{task.reminder && <div><small>Reminder</small><strong>{task.reminder === 'at-due' ? 'At due time' : `${task.reminder} minutes before`}</strong></div>}{task.emailReminder && <div><small>Email reminder</small><strong>Sent at due time</strong></div>}</div>{task.tags?.length > 0 && <><h3>Tags</h3><div className="detail-tags">{task.tags.map((tag) => <span className="pill tag" key={tag}>{tag}</span>)}</div></>}
+  return <div className="detail-page-backdrop" role="presentation"><article className="detail-page"><div className="detail-page-header"><AppButton className="secondary-button" onClick={onClose}>← Back</AppButton><div>{canEdit && <AppButton className="secondary-button" loading={toggling} onClick={onToggle}>{toggling ? 'Updating…' : task.status === 'Completed' ? 'Mark incomplete' : 'Mark complete'}</AppButton>}{!task.shared && authUser && <AppButton className="secondary-button" onClick={() => onInvite(task)}>Share task</AppButton>}{canEdit && <AppButton className="secondary-button" onClick={onEdit}>Edit task</AppButton>}{!task.shared && <AppButton className="icon-button danger-icon" aria-label="Delete task" title="Delete task" loading={deleting} onClick={onDelete}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/></svg></AppButton>}<AppButton className="close" aria-label="Close task details" onClick={onClose}>×</AppButton></div></div>{task.shared && <div className="shared-task-banner">Shared with you · {task.sharedPermission === 'editor' ? 'You can make changes' : 'View only'}</div>}<div className="detail-kicker">{task.status} · {task.priority}</div><h1>{task.title}</h1>{task.description && <p className="detail-description">{task.description}</p>}<div className="detail-grid">{task.start && <div><small>Start date</small><strong>{fmtDate(task.start, { year: 'numeric', month: 'long', day: 'numeric' })}</strong></div>}{task.due && <div><small>Due</small><strong>{fmtDate(task.due, { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</strong></div>}{task.folder && <div><small>Folder</small><strong>{task.folder}</strong></div>}{task.recurrence && <div><small>Repeat</small><strong>{task.recurrence}</strong></div>}{task.reminder && <div><small>Reminder</small><strong>{task.reminder === 'at-due' ? 'At due time' : `${task.reminder} minutes before`}</strong></div>}{task.emailReminder && <div><small>Email reminder</small><strong>Sent at due time</strong></div>}</div>{task.tags?.length > 0 && <><h3>Tags</h3><div className="detail-tags">{task.tags.map((tag) => <span className="pill tag" key={tag}>{tag}</span>)}</div></>}
     <section className="checklist-progress" aria-label="Task checklist progress"><div className="checklist-progress-heading"><strong>Task checklist</strong><span>{completed} of {items.length} completed</span></div><div className="checklist-progress-track" role="progressbar" aria-label="Checklist progress" aria-valuemin="0" aria-valuemax={items.length || 0} aria-valuenow={completed}><span style={{ width: `${percent}%` }} /></div></section>
     <ul className="detail-checklist">{items.length ? items.map((item, index) => { const checked = Boolean(item.is_completed ?? item.done); const saving = typeof savingSubtask === 'function' ? savingSubtask() : false; return <li className={checked ? 'checklist-done' : ''} key={item.id || `${item.text}-${index}`}><label><TextInput type="checkbox" checked={checked} disabled={!canEdit || saving} onChange={() => onSubtask(index)} aria-label={`${checked ? 'Mark incomplete' : 'Mark complete'}: ${item.text}`} /><span className="checklist-item-text"><span className="checklist-item-copy">{item.text}</span>{checked && item.completed_at && <small className="checklist-timestamp">Completed {fmtDate(item.completed_at, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small>}</span>{saving && <small className="checklist-saving">Saving…</small>}</label></li>; }) : <li className="checklist-empty">No checklist items yet.</li>}</ul>
     {task.attachments?.length > 0 && <><h3>Attachments</h3><ul>{task.attachments.map((file, index) => <li key={`${file.name}-${index}`}>⌁ {file.name}</li>)}</ul></>}{task.notes && <><h3>Notes</h3><p className="detail-description">{task.notes}</p></>}
     {task.shared && authUser && <CollaborationComments task={task} canComment={task.sharedPermission === 'editor'} onUpdated={onUpdated} />}
     {!task.shared && authUser && <TaskCollaborationPanel task={task} onUpdated={onUpdated} />}
-    {!task.shared && <AppButton className="delete-task detail-delete" loading={deleting} onClick={onDelete}>{deleting ? 'Deleting…' : 'Delete task'}</AppButton>}
+
     </article></div>;
 }
 
@@ -1286,7 +1307,7 @@ function CollaborationComments({ task, canComment, onUpdated }) {
   const [comments, setComments] = useState([]); const [message, setMessage] = useState(''); const [loading, setLoading] = useState(false); const [saving, setSaving] = useState(false); const [error, setError] = useState('');
   useEffect(() => { let active = true; setLoading(true); api(`/tasks/${task.id}/comments`).then((rows) => { if (active) setComments(rows || []); }).catch((err) => { if (active) setError(err.message); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [task.id]);
   async function submit(event) { event.preventDefault(); if (!message.trim() || saving) return; setSaving(true); setError(''); try { const saved = await api(`/tasks/${task.id}/comments`, { method: 'POST', body: { message } }); setComments((items) => [...items, saved]); setMessage(''); onUpdated(); } catch (err) { setError(err.message); } finally { setSaving(false); } }
-  return <section className="collaboration-comments"><h3>Comments</h3>{loading ? <p>Loading comments…</p> : comments.length ? comments.map((comment) => <article className="collaboration-comment" key={comment.id}><strong>{comment.author?.username || 'Collaborator'}</strong><p>{comment.message}</p><small>{fmtDate(comment.createdAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></article>) : <p>No comments yet.</p>}{error && <p role="alert" className="form-error">{error}</p>}{canComment && <form onSubmit={submit}><TextInput value={message} onChange={(event) => setMessage(event.target.value)} maxLength="2000" placeholder="Add a comment" aria-label="Add a comment" /><AppButton className="save-task" loading={saving} disabled={!message.trim()}>{saving ? 'Posting…' : 'Post'}</AppButton></form>}</section>;
+  return <section className="collaboration-comments"><h3>Comments</h3>{loading ? <p>Loading comments…</p> : comments.length ? comments.map((comment) => <article className="collaboration-comment" key={comment.id}><strong>{comment.author?.username || 'Collaborator'}</strong><p>{comment.message}</p><small>{fmtDate(comment.createdAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></article>) : <p>No comments yet.</p>}{error && <p role="alert" className="form-error">{error}</p>}{canComment && <form onSubmit={submit}><textarea className="app-input comment-input" value={message} onChange={(event) => setMessage(event.target.value)} maxLength="2000" rows="3" placeholder="Write a comment…" aria-label="Write a comment" /><AppButton className="save-task" loading={saving} disabled={!message.trim()}>{saving ? 'Posting…' : 'Post'}</AppButton></form>}</section>;
 }
 
 function Modal({ title, children, onClose, className = '' }) {
