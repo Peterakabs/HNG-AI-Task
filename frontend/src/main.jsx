@@ -367,9 +367,10 @@ function App() {
         const user = await api('/auth/google/session', { method: 'POST', body: { accessToken: session.access_token, refreshToken: session.refresh_token } });
         googleSigninCompletionRef.current = 'complete';
         sessionStorage.removeItem('spectre.google.intent');
-        // The backend now owns the app session. Clear the temporary OAuth session
-        // so a later sign-in starts cleanly and can select a different Google user.
-        try { await googleAuth.auth.signOut({ scope: 'local' }); } catch { /* The verified backend session is already established. */ }
+        // Do not call Supabase signOut here: even local sign-out revokes the refresh
+        // token that Spectre just stored in its own session cookie.
+        sessionStorage.removeItem('spectre-google-oauth-session');
+        sessionStorage.removeItem('spectre-google-oauth-session-code-verifier');
         const hasGuestData = tasks.length > 0 || notes.length > 0 || tags.length > 0 || folders.some((folder) => !['Personal', 'Work'].includes(folder));
         setAuthUser(user);
         if (hasGuestData) { setGuestTransferSummary({ tasks: tasks.length, notes: notes.length }); setModal('guest-transfer'); }
@@ -377,8 +378,6 @@ function App() {
         else showFeedback('success', 'You are signed in with Google.');
         await reload();
         window.history.replaceState({}, '', window.location.pathname);
-        sessionStorage.removeItem('spectre-google-oauth-session');
-        sessionStorage.removeItem('spectre-google-oauth-session-code-verifier');
       } catch (err) {
         googleSigninCompletionRef.current = 'idle';
         sessionStorage.removeItem('spectre.google.intent');
