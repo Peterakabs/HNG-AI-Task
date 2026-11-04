@@ -415,7 +415,15 @@ export class IdentityMiddleware implements NestMiddleware {
         request.path.startsWith('/api/guest/reminders/')
       ) return next();
       try {
-        const session = await this.auth.identityFromCookie(request.headers.cookie);
+        let session: Awaited<ReturnType<AuthService['identityFromCookie']>> | undefined;
+        try {
+          session = await this.auth.identityFromCookie(request.headers.cookie);
+        } catch (error) {
+          if (!(error instanceof UnauthorizedException)) throw error;
+          // An expired or invalid app session should stop being treated as logged in.
+          // Clear it and let normal requests continue under the persistent guest identity.
+          response.clearCookie('spectre_session', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' });
+        }
         let identity: RequestIdentity | undefined = session?.identity;
         if (session?.session) response.cookie('spectre_session', session.session, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 24 * 60 * 60 * 1000 });
         if (!identity) {
