@@ -1,17 +1,20 @@
-import { Body, Controller, Delete, Get, Logger, Param, Patch, Post, Put, Query, Req, Res, UnauthorizedException } from '@nestjs/common';
+import { Body, Controller, Delete, ForbiddenException, Get, Logger, NotFoundException, Param, Patch, Post, Put, Query, Req, Res, UnauthorizedException, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
 import { SpectreService } from './spectre.service';
 import { AuthService, RequestIdentity } from './auth.service';
 import { SupabaseService } from './supabase.service';
 import { VoiceAssistantService } from './voice-assistant.service';
 import { GoogleCalendarService } from './google-calendar.service';
+import { ProfileImageService } from './profile-image.service';
+import { CollaborationService } from './collaboration.service';
 
 type IdentityRequest = Request & { identity?: RequestIdentity };
 
 @Controller('api')
 export class AppController {
   private readonly logger = new Logger(AppController.name);
-  constructor(private readonly service: SpectreService, private readonly auth: AuthService, private readonly supabase: SupabaseService, private readonly voice: VoiceAssistantService, private readonly googleCalendar: GoogleCalendarService) {}
+  constructor(private readonly service: SpectreService, private readonly auth: AuthService, private readonly supabase: SupabaseService, private readonly voice: VoiceAssistantService, private readonly googleCalendar: GoogleCalendarService, private readonly profileImages: ProfileImageService, private readonly collaboration: CollaborationService) {}
 
   @Get('health') health() { return { status: 'ok', service: 'spectre-api' }; }
   @Get('health/supabase') supabaseHealth() { return this.supabase.checkConnection(); }
@@ -82,9 +85,61 @@ export class AppController {
   @Post('weekly-summaries/:id/viewed') markWeeklySummaryViewed(@Param('id') id: string) { return this.service.markWeeklySummaryViewed(id); }
   @Post('tasks') createTask(@Body() body: Record<string, any>) { return this.service.createTask(body); }
   @Put('tasks/reorder') reorder(@Body('ids') ids: string[]) { return this.service.reorderTasks(ids); }
-  @Get('tasks/:id') task(@Param('id') id: string) { return this.service.getTask(id); }
-  @Patch('tasks/:id') updateTask(@Param('id') id: string, @Body() body: Record<string, any>) { return this.service.updateTask(id, body); }
-  @Delete('tasks/:id') deleteTask(@Param('id') id: string, @Query('series') series?: string) { return this.service.deleteTask(id, series === 'true'); }
+  @Get('tasks/:id') async task(@Req() request: IdentityRequest, @Param('id') id: string) {
+    if (request.identity?.type === 'user') {
+      const shared = await this.collaboration.sharedTaskForUser(request.identity.id, id);
+      if (shared) return shared;
+    }
+    return this.service.getTask(id);
+  }
+  @Patch('tasks/:id') async updateTask(@Req() request: IdentityRequest, @Param('id') id: string, @Body() body: Record<string, any>) {
+    if (request.identity?.type === 'user') {
+      const shared = await this.collaboration.sharedTaskForUser(request.identity.id, id);
+      if (shared) return this.collaboration.updateSharedTask(request.identity.id, id, body);
+      const result = await this.service.updateTask(id, body, undefined, request.identity.id);
+      await this.collaboration.notifyOwnerTaskUpdated(request.identity.id, id);
+      return result;
+    }
+    return this.service.updateTask(id, body);
+  }
+  @Delete('tasks/:id') async deleteTask(@Req() request: IdentityRequest, @Param('id') id: string, @Query('series') series?: string) {
+    if (request.identity?.type === 'user') {
+      if (await this.collaboration.sharedTaskForUser(request.identity.id, id)) throw new ForbiddenException('Only the task owner can delete a shared task.');
+      const task = await this.service.getTask(id);
+      const cleanupIds = series === 'true' && task.recurrenceId ? (await this.service.listTasks()).filter((item) => item.recurrenceId === task.recurrenceId).map((item) => item.id) : [id];
+      const deleted = await this.service.deleteTask(id, series === 'true');
+      await Promise.all(cleanupIds.map((taskId) => this.collaboration.cleanupDeletedTask(request.identity!.id, taskId)));
+      return deleted;
+    }
+    return this.service.deleteTask(id, series === 'true');
+  }
+  @Get('collaboration/shared-tasks') sharedTasks(@Req() request: IdentityRequest) { return this.collaboration.sharedTasks(this.requireUser(request)); }
+  @Post('tasks/:id/invitations') createTaskInvitation(@Req() request: IdentityRequest, @Param('id') id: string, @Body() body: Record<string, any>) {
+    const identity = request.identity;
+    if (identity?.type !== 'user') throw new UnauthorizedException('Sign in to invite someone to a task.');
+    return this.collaboration.createInvitation(identity.id, identity.email || '', id, body);
+  }
+  @Get('collaboration/invitations/:token') invitationDetails(@Req() request: IdentityRequest, @Param('token') token: string) {
+    const identity = request.identity;
+    if (identity?.type !== 'user') throw new UnauthorizedException('Sign in with the invited email address to view this invitation.');
+    return this.collaboration.invitationDetails(identity.id, identity.email || '', Boolean(identity.emailVerified), token);
+  }
+  @Post('collaboration/invitations/:token/accept') acceptInvitation(@Req() request: IdentityRequest, @Param('token') token: string) {
+    const identity = request.identity;
+    if (identity?.type !== 'user') throw new UnauthorizedException('Sign in with the invited email address to accept this invitation.');
+    return this.collaboration.acceptInvitation(identity.id, identity.email || '', Boolean(identity.emailVerified), token);
+  }
+  @Post('collaboration/invitations/:token/decline') declineInvitation(@Req() request: IdentityRequest, @Param('token') token: string) {
+    const identity = request.identity;
+    if (identity?.type !== 'user') throw new UnauthorizedException('Sign in with the invited email address to decline this invitation.');
+    return this.collaboration.declineInvitation(identity.id, identity.email || '', Boolean(identity.emailVerified), token);
+  }
+  @Get('tasks/:id/collaboration') taskCollaboration(@Req() request: IdentityRequest, @Param('id') id: string) { return this.collaboration.taskCollaboration(this.requireUser(request), id); }
+  @Patch('tasks/:id/collaborators/:collaboratorId') changeCollaboratorPermission(@Req() request: IdentityRequest, @Param('id') taskId: string, @Param('collaboratorId') collaboratorId: string, @Body('permission') permission: string) { return this.collaboration.changePermission(this.requireUser(request), taskId, collaboratorId, permission); }
+  @Delete('tasks/:id/collaborators/:collaboratorId') removeTaskCollaborator(@Req() request: IdentityRequest, @Param('id') taskId: string, @Param('collaboratorId') collaboratorId: string) { return this.collaboration.removeCollaborator(this.requireUser(request), taskId, collaboratorId); }
+  @Delete('tasks/:id/invitations/:invitationId') revokeTaskInvitation(@Req() request: IdentityRequest, @Param('id') taskId: string, @Param('invitationId') invitationId: string) { return this.collaboration.revokeInvitation(this.requireUser(request), taskId, invitationId); }
+  @Get('tasks/:id/comments') getTaskComments(@Req() request: IdentityRequest, @Param('id') id: string) { return this.collaboration.comments(this.requireUser(request), id); }
+  @Post('tasks/:id/comments') addTaskComment(@Req() request: IdentityRequest, @Param('id') id: string, @Body('message') message: string) { return this.collaboration.addComment(this.requireUser(request), id, message); }
 
   @Get('folders') folders() { return this.service.listFolders(); }
   @Post('folders') createFolder(@Body('name') name: string) { return this.service.createFolder(name); }
@@ -98,8 +153,28 @@ export class AppController {
   @Patch('notes/:id') updateNote(@Param('id') id: string, @Body() body: Record<string, any>) { return this.service.updateNote(id, body); }
   @Delete('notes/:id') deleteNote(@Param('id') id: string) { return this.service.deleteNote(id); }
 
-  @Get('profile') profile() { return this.service.getProfile(); }
+  @Get('profile') async profile(@Req() request: IdentityRequest) {
+    const profile = await this.service.getProfile();
+    if (request.identity?.type === 'user') {
+      const avatarUrl = await this.profileImages.avatarUrl(request.identity.id);
+      if (avatarUrl) return { ...profile, avatarUrl };
+    }
+    return profile;
+  }
   @Put('profile') updateProfile(@Body() body: Record<string, any>) { return this.service.updateProfile(body); }
+  @Post('profile/avatar') @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 5 * 1024 * 1024 } }))
+  uploadProfileAvatar(@Req() request: IdentityRequest, @UploadedFile() file?: { buffer: Buffer; mimetype: string; size: number }) {
+    if (request.identity?.type !== 'user') throw new UnauthorizedException('Sign in to add a profile photo.');
+    return this.profileImages.upload(request.identity.id, file || {});
+  }
+  @Get('profile/avatar') async profileAvatar(@Req() request: IdentityRequest, @Res() response: Response) {
+    if (request.identity?.type !== 'user') throw new UnauthorizedException('Sign in to view your profile photo.');
+    const avatar = await this.profileImages.download(request.identity.id);
+    response.setHeader('Content-Type', avatar.contentType);
+    response.setHeader('Cache-Control', 'private, max-age=300');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    return response.send(avatar.buffer);
+  }
   @Put('auth/password') updatePassword(@Req() request: IdentityRequest, @Body() body: Record<string, any>) { return this.auth.changePassword(this.requireUser(request), body); }
 
   @Get('google-calendar/oauth/start') startGoogleCalendarOAuth(@Req() request: IdentityRequest, @Res() response: Response) {

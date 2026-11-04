@@ -18,7 +18,7 @@ The React app runs at `http://localhost:5173`; Vite proxies `/api` calls to Nest
 
 ## Supabase project setup
 
-The target Supabase project is `lgseazfkoqaozavyozno` (`https://lgseazfkoqaozavyozno.supabase.co`). In Supabase Dashboard, open **SQL Editor**, create a query, paste and run `supabase/migrations/202611010001_initial.sql`, followed by `supabase/migrations/202611010002_add_spectre_data_revision.sql`. This creates an empty app schema and does not import local JSON data. Under **Project Settings → API Keys**, create/copy a server-side **Secret key**, and keep it private. Do not place it in frontend variables or commit it.
+The target Supabase project is `lgseazfkoqaozavyozno` (`https://lgseazfkoqaozavyozno.supabase.co`). In Supabase Dashboard, open **SQL Editor**, create a query, paste and run the migrations in order: `202611010001_initial.sql`, `202611010002_add_spectre_data_revision.sql`, `202611040001_profile_picture_storage.sql`, and `202611040002_task_collaboration.sql`. The profile migration creates the private `profile-pictures` bucket. The collaboration migration creates invitations, collaborators, comments, and notification support. Checklist completion metadata stays with each task in the existing `spectre_data` JSON document; no separate checklist table is needed. Under **Project Settings → API Keys**, create/copy a server-side **Secret key**, and keep it private. Do not place it in frontend variables or commit it.
 
 Copy `backend/.env.example` to `backend/.env`, then put your Secret key in `SUPABASE_SECRET_KEY`. Node loads this file when the NestJS server starts. The `.env` file is ignored by Git. In Supabase **Authentication → URL Configuration**, allow `http://localhost:5173/**` as a redirect URL for password reset links. Configure Supabase Auth email delivery before relying on password recovery in production.
 
@@ -43,6 +43,8 @@ Email delivery uses Resend's Email API. Set these backend environment variables 
 - `EMAIL_FROM` (an address on a verified Resend domain)
 - `APP_URL` (the public app URL used by reminder links)
 - `APP_NAME` (optional; defaults to Spectre)
+
+Task collaboration shares a time-limited, single-use invitation link for the email address entered by the task owner. Spectre does not email invitations; the owner copies and sends the link privately. The recipient must sign in with that verified email and explicitly accept or decline. Viewer and Editor access is enforced by the API. Set `APP_URL` to the browser-visible frontend origin so generated links open Spectre.
 
 The optional voice assistant interprets reminder requests through Google's Gemini API. Create an API key in [Google AI Studio](https://aistudio.google.com/app/apikey), then add `GEMINI_API_KEY` to the **backend** environment. `GEMINI_MODEL` is optional and defaults to `gemini-3.8-flash`. Keep the key out of Vite/frontend variables. The browser uses its built-in speech recognition and speech synthesis where supported; typed requests remain available when voice recognition is unavailable. Audio is not uploaded or stored; only recognized text is sent to the backend. The assistant produces a draft and never creates or schedules it until the user confirms. Personal reminders use the existing task API; email reminders use the authenticated scheduled-action API and existing Resend configuration.
 
