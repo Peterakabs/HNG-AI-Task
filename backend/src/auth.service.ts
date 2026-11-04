@@ -404,7 +404,16 @@ export class IdentityMiddleware implements NestMiddleware {
   constructor(private readonly auth: AuthService, private readonly scopes: ScopeContext) {}
   use(request: Request & { identity?: RequestIdentity }, response: Response, next: NextFunction) {
     void (async () => {
-      if (request.path === '/api/health' || request.path === '/api/health/supabase' || request.path.startsWith('/api/guest/reminders/')) return next();
+      // Credential exchange and sign-out must remain reachable when the browser
+      // has an expired session cookie; otherwise users cannot replace that session.
+      if (
+        request.path === '/api/health' ||
+        request.path === '/api/health/supabase' ||
+        request.path === '/api/auth/login' ||
+        request.path === '/api/auth/logout' ||
+        request.path === '/api/auth/google/session' ||
+        request.path.startsWith('/api/guest/reminders/')
+      ) return next();
       try {
         const session = await this.auth.identityFromCookie(request.headers.cookie);
         let identity: RequestIdentity | undefined = session?.identity;
