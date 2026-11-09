@@ -109,7 +109,17 @@ const localWeekRange = (value = new Date()) => {
   return { start: isoDate(start), end: isoDate(end) };
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
-const fmtDate = (value, options = { month: 'short', day: 'numeric' }) => value ? new Intl.DateTimeFormat(undefined, options).format(new Date(value)) : '';
+const dateFormatters = new Map();
+const fmtDate = (value, options = { month: 'short', day: 'numeric' }) => {
+  if (!value) return '';
+  const key = JSON.stringify(options);
+  let formatter = dateFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(undefined, options);
+    dateFormatters.set(key, formatter);
+  }
+  return formatter.format(new Date(value));
+};
 const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 const escapeXml = (value = '') => String(value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[character]));
 const downloadFile = (filename, content, type) => {
@@ -231,6 +241,8 @@ function App() {
   const [createdInvite, setCreatedInvite] = useState(null);
   const [inviteTask, setInviteTask] = useState(null);
   const [weeklySummaries, setWeeklySummaries] = useState([]);
+  const weeklySummarySignatureRef = useRef('');
+  const lastWeeklySummaryCheckRef = useRef(0);
   const [activeWeeklySummary, setActiveWeeklySummary] = useState(null);
   const [folders, setFolders] = useState([]);
   const [tags, setTags] = useState([]);
@@ -263,6 +275,7 @@ function App() {
   const [notificationPreferences, setNotificationPreferences] = useState({ inApp: true, browserPush: false, taskReminders: true, collaborationUpdates: true, browserPushAvailable: false });
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationsRef = useRef(null);
+  const lastNotificationRefreshRef = useRef(0);
   const notificationTriggerRef = useRef(null);
   const [view, setView] = useState('today');
   const [navOpen, setNavOpen] = useState(false);
@@ -314,9 +327,13 @@ function App() {
 
   const refreshNotifications = useCallback(async () => {
     const result = await api('/notifications');
-    setNotifications(result.notifications || []);
-    setUnreadNotificationCount(result.unreadCount || 0);
-    setNotificationHasMore(Boolean(result.hasMore));
+    lastNotificationRefreshRef.current = Date.now();
+    const next = result.notifications || [];
+    setNotifications((current) => JSON.stringify(current) === JSON.stringify(next) ? current : next);
+    const unreadCount = result.unreadCount || 0;
+    setUnreadNotificationCount((current) => current === unreadCount ? current : unreadCount);
+    const hasMore = Boolean(result.hasMore);
+    setNotificationHasMore((current) => current === hasMore ? current : hasMore);
     return result;
   }, []);
 
@@ -400,35 +417,41 @@ function App() {
         setProfileDraft({ username: '', phone: '', avatarUrl: '' });
         sessionStorage.removeItem('spectre.voice-assistant-session');
       }
-      const [nextTasks, nextFolders, nextTags, nextNotes, profile] = await Promise.all([
-        api('/tasks'), api('/folders'), api('/tags'), api('/notes'), api('/profile'),
+      const timezone = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone);
+      const optional = (promise, fallback) => promise.catch((err) => { console.warn('[Spectre] Optional data could not be loaded:', err.message); return fallback; });
+      const optionalLoads = Promise.all([
+        optional(api('/notification-preferences'), null),
+        optional(api('/notifications'), null),
+        user ? optional(api('/google-calendar/status'), { connected: false, email: null }) : Promise.resolve({ connected: false, email: null }),
+        user ? optional(api('/collaboration/shared-tasks'), null) : Promise.resolve([]),
       ]);
+      void optionalLoads.then(([preferences, notificationResult, calendarStatus, nextSharedTasks]) => {
+        if (requestId !== reloadRequestRef.current) return;
+        if (preferences) setNotificationPreferences(preferences);
+        if (notificationResult) {
+          lastNotificationRefreshRef.current = Date.now();
+          setNotifications(notificationResult.notifications || []); setUnreadNotificationCount(notificationResult.unreadCount || 0); setNotificationHasMore(Boolean(notificationResult.hasMore));
+        }
+        setGoogleCalendarStatus(calendarStatus || { connected: false, email: null });
+        if (Array.isArray(nextSharedTasks)) setSharedTasks(nextSharedTasks);
+        if (!user) setGoogleCalendarEvents([]);
+      });
+      const [nextFolders, nextTags, nextNotes, profile, summaries] = await Promise.all([
+        api('/folders'), api('/tags'), api('/notes'), api('/profile'),
+        optional(api(`/weekly-summaries?timezone=${timezone}`), null),
+      ]);
+      if (requestId !== reloadRequestRef.current) return;
+      // Weekly summary creation archives completed tasks, so fetch tasks after it settles.
+      const nextTasks = await api('/tasks');
       if (requestId !== reloadRequestRef.current) return;
       if (![nextTasks, nextFolders, nextTags, nextNotes].every(Array.isArray) || !profile?.username) throw new Error('The API returned an unexpected response. Restart the updated NestJS server and try again.');
       setTasks(nextTasks); setFolders(nextFolders); setTags(nextTags); setNotes(nextNotes);
       setUsername(profile.username); setProfileDraft({ username: profile.username, phone: profile.phone || '', avatarUrl: profile.avatarUrl || '' }); setAuthUser(user); setError(''); setSessionExpired(false);
-      try {
-        const preferences = await api('/notification-preferences');
-        if (requestId === reloadRequestRef.current) setNotificationPreferences(preferences);
-      } catch (preferencesError) { console.warn('[Spectre] Could not load notification settings:', preferencesError.message); }
-      try {
-        const summaries = await api(`/weekly-summaries?timezone=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`);
-        if (requestId !== reloadRequestRef.current) return;
-        if (Array.isArray(summaries)) {
-          setWeeklySummaries(summaries);
-          const activeTasks = await api('/tasks');
-          if (requestId !== reloadRequestRef.current) return;
-          if (Array.isArray(activeTasks)) setTasks(activeTasks);
-        }
-      } catch (summaryError) { console.warn('[Spectre] Could not refresh weekly summaries:', summaryError.message); }
-      {
-        try { const result = await api('/notifications'); if (requestId === reloadRequestRef.current) { setNotifications(result.notifications || []); setUnreadNotificationCount(result.unreadCount || 0); setNotificationHasMore(Boolean(result.hasMore)); } }
-        catch (notificationError) { console.warn('[Spectre] Could not load notifications:', notificationError.message); }
+      if (Array.isArray(summaries)) {
+        setWeeklySummaries(summaries);
+        weeklySummarySignatureRef.current = summaries.map((item) => `${item.id}:${item.viewedAt || ''}:${item.tasks?.length || 0}`).join('|');
       }
-      if (user) {
-        try { const status = await api('/google-calendar/status'); if (requestId === reloadRequestRef.current) setGoogleCalendarStatus(status); }
-        catch (calendarError) { console.warn('[Spectre] Could not load Google Calendar status:', calendarError.message); setGoogleCalendarStatus({ connected: false, email: null }); }
-      } else { setGoogleCalendarStatus({ connected: false, email: null }); setGoogleCalendarEvents([]); }
+      lastWeeklySummaryCheckRef.current = Date.now();
     } catch (err) { if (requestId === reloadRequestRef.current) { setError(err.message); setSessionExpired(err.status === 401); } }
     finally { if (requestId === reloadRequestRef.current) setLoading(false); }
   }, []);
@@ -460,12 +483,6 @@ function App() {
     }).catch((err) => { if (active) { setCollaborationInvite(null); setCollaborationToken(''); window.history.replaceState({}, '', window.location.pathname); showFeedback('error', err.message, 'Invitation unavailable'); } });
     return () => { active = false; };
   }, [loading, authUser, collaborationToken, guestTransferSummary, showFeedback]);
-  useEffect(() => {
-    if (!authUser) { setSharedTasks([]); return; }
-    let active = true;
-    api('/collaboration/shared-tasks').then((rows) => { if (active) setSharedTasks(Array.isArray(rows) ? rows : []); }).catch((err) => console.warn('[Spectre] Could not load shared tasks:', err.message));
-    return () => { active = false; };
-  }, [authUser, tasks]);
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const result = params.get('googleCalendar');
@@ -549,16 +566,25 @@ function App() {
     return () => { active = false; };
   }, [authUser, googleCalendarStatus.connected, view, month, showFeedback]);
   useEffect(() => {
-    const timer = window.setInterval(async () => {
+    const checkSummary = async () => {
+      if (document.visibilityState !== 'visible' || navigator.onLine === false) return;
       try {
         const summaries = await api(`/weekly-summaries?timezone=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`);
         if (!Array.isArray(summaries)) return;
-        setWeeklySummaries(summaries);
-        const activeTasks = await api('/tasks');
-        if (Array.isArray(activeTasks)) setTasks(activeTasks);
+        lastWeeklySummaryCheckRef.current = Date.now();
+        const signature = summaries.map((item) => `${item.id}:${item.viewedAt || ''}:${item.tasks?.length || 0}`).join('|');
+        if (signature !== weeklySummarySignatureRef.current) {
+          weeklySummarySignatureRef.current = signature;
+          setWeeklySummaries(summaries);
+          const activeTasks = await api('/tasks');
+          if (Array.isArray(activeTasks)) setTasks(activeTasks);
+        }
       } catch (summaryError) { console.warn('[Spectre] Could not check for a weekly summary:', summaryError.message); }
-    }, 60_000);
-    return () => window.clearInterval(timer);
+    };
+    const timer = window.setInterval(checkSummary, 10 * 60_000);
+    const onVisible = () => { if (document.visibilityState === 'visible' && Date.now() - lastWeeklySummaryCheckRef.current > 10 * 60_000) void checkSummary(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
   }, []);
   useEffect(() => {
     if (loading || modal || assistantOpen || selectedTask) return;
@@ -567,8 +593,13 @@ function App() {
   }, [weeklySummaries, loading, modal, assistantOpen, selectedTask]);
   useEffect(() => {
     if (loading) return undefined;
-    const timer = window.setInterval(() => { refreshNotifications().catch((err) => console.warn('[Spectre] Could not refresh notifications:', err.message)); }, 30_000);
-    return () => window.clearInterval(timer);
+    const refreshIfVisible = () => {
+      if (document.visibilityState !== 'visible' || navigator.onLine === false || Date.now() - lastNotificationRefreshRef.current < 60_000) return;
+      refreshNotifications().catch((err) => console.warn('[Spectre] Could not refresh notifications:', err.message));
+    };
+    const timer = window.setInterval(refreshIfVisible, 60_000);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', refreshIfVisible); };
   }, [loading, refreshNotifications]);
   useEffect(() => { if (pendingReminder) sessionStorage.setItem('spectre.pending-reminder', JSON.stringify(pendingReminder)); else sessionStorage.removeItem('spectre.pending-reminder'); }, [pendingReminder]);
   useEffect(() => { if (!loading && pendingReminder && !modal) setModal(authUser ? (pendingReminder.recipientEmail ? 'reminder-confirm' : 'recipient') : 'auth'); }, [loading, pendingReminder, authUser, modal]);
@@ -634,7 +665,8 @@ function App() {
 
   function changeView(next) { setView(next); setSelectedFolder(''); setSelectedTag(''); setNavOpen(false); }
   function startCreateTask(defaults = {}) { setEditingId(null); setTaskDraft(emptyTask(defaults)); setSubtaskText(''); setAttachmentFiles([]); setModal('task'); }
-  function editTask(task) { setEditingId(task.id); setTaskDraft({ ...task, tags: (task.tags || []).join(', '), due: task.due?.slice(0, 16) || '' }); setSubtaskText(''); setAttachmentFiles(task.attachments || []); setSelectedTask(null); setModal('task'); }
+  const editTask = useCallback((task) => { setEditingId(task.id); setTaskDraft({ ...task, tags: (task.tags || []).join(', '), due: task.due?.slice(0, 16) || '' }); setSubtaskText(''); setAttachmentFiles(task.attachments || []); setSelectedTask(null); setModal('task'); }, []);
+  const openTask = useCallback((task) => setSelectedTask(task), []);
   async function saveTask(event) {
     event.preventDefault();
     setBusyAction('save-task');
@@ -871,14 +903,14 @@ function App() {
     } catch (err) { setLoading(false); setFeedback({ kind: 'error', title: 'Sign out failed', message: userFacingFeedback(err.message) }); setModal('feedback'); }
     finally { setBusyAction(''); }
   }
-  async function toggleTask(task) {
+  const toggleTask = useCallback(async (task) => {
     if (toggleRequests.current.has(task.id)) return;
     toggleRequests.current.add(task.id);
     setBusyAction(`toggle-${task.id}`);
-    try { const response = await api(`/tasks/${task.id}`, { method: 'PATCH', body: { status: task.status === 'Completed' ? 'To Do' : 'Completed' } }); await reload(); if (response.recurringTask) notify('Next recurring task scheduled'); if (selectedTask?.id === task.id) setSelectedTask(response.task); }
+    try { const response = await api(`/tasks/${task.id}`, { method: 'PATCH', body: { status: task.status === 'Completed' ? 'To Do' : 'Completed' } }); await reload(); if (response.recurringTask) notify('Next recurring task scheduled'); setSelectedTask((current) => current?.id === task.id ? response.task : current); }
     catch (err) { showFeedback('error', err.message); }
     finally { toggleRequests.current.delete(task.id); setBusyAction(''); }
-  }
+  }, [reload, notify, showFeedback]);
   async function toggleSubtask(task, index) {
     const key = task.id;
     if (toggleRequests.current.has(key)) return;
@@ -1032,11 +1064,12 @@ function App() {
     catch (err) { showFeedback('error', err.message); }
     finally { setBusyAction(''); }
   }
-  function moveTask(fromId, toId) {
+  const moveTask = useCallback((fromId, toId) => {
     const ids = tasks.map((task) => task.id); const from = ids.indexOf(fromId); const to = ids.indexOf(toId);
+    if (from < 0 || to < 0 || from === to) return;
     ids.splice(to, 0, ids.splice(from, 1)[0]); setTasks((current) => current.map((task) => ({ ...task, order: ids.indexOf(task.id) })));
     api('/tasks/reorder', { method: 'PUT', body: { ids } }).catch((err) => { showFeedback('error', err.message); reload(); });
-  }
+  }, [tasks, showFeedback, reload]);
   function openFolderForm() { setNameDraft(''); setNavOpen(false); setModal('folder'); }
   function openTagForm() { setNameDraft(''); setNavOpen(false); setModal('tag'); }
 
@@ -1072,8 +1105,8 @@ function App() {
         <div className="toolbar"><h2>{listTitle}</h2><div className="toolbar-actions"><TextInput className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by title" aria-label="Search tasks by title" /><AppButton className="filter-toggle" aria-expanded={mobileFiltersOpen} aria-controls="task-filters" onClick={() => setMobileFiltersOpen((open) => !open)}>Filter</AppButton></div></div>
         <div className={`filters ${mobileFiltersOpen ? 'filters-open' : ''}`} id="task-filters"><label className="sort-control">Sort<select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort tasks"><option value="manual">Manual order</option><option value="due">Due date</option><option value="priority">Priority</option><option value="created">Creation date</option><option value="alpha">Alphabetical</option></select></label><AppButton className="create-tag-btn" onClick={openTagForm}>＋ Create tag</AppButton><select aria-label="Filter status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="">Any status</option>{['To Do', 'Pending', 'Acknowledged', 'In Progress', 'Completed'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter priority" value={filters.priority} onChange={(event) => setFilters({ ...filters, priority: event.target.value })}><option value="">Any priority</option>{['High', 'Medium', 'Low'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter tag" value={filters.tag} onChange={(event) => setFilters({ ...filters, tag: event.target.value })}><option value="">Any tag</option>{tags.map((tag) => <option key={tag}>{tag}</option>)}</select><select aria-label="Filter folder" value={filters.folder} onChange={(event) => setFilters({ ...filters, folder: event.target.value })}><option value="">Any folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select><select aria-label="Filter date" value={filters.date} onChange={(event) => setFilters({ ...filters, date: event.target.value })}><option value="">Any date</option><option value="overdue">Overdue</option><option value="today">Due today</option><option value="week">Next 7 days</option><option value="none">No due date</option></select></div>
         {view === 'all' && <section className="weekly-review" aria-label="Weekly summaries"><div className="weekly-review-heading"><div><h2>Weekly task view</h2><p>Showing this week’s tasks · {fmtDate(`${currentWeek.start}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${currentWeek.end}T12:00:00`, { month: 'short', day: 'numeric' })}</p></div><strong>{completedThisWeek} completed this week</strong></div>{authUser && <div className="task-scope-tabs" role="tablist" aria-label="Choose task list">{[['mine','My tasks'],['shared','Shared with me'],['all','All tasks']].map(([key,label]) => <AppButton key={key} role="tab" aria-selected={taskScope === key} className={taskScope === key ? 'active' : ''} onClick={() => setTaskScope(key)}>{label}{key === 'shared' && sharedTasks.length > 0 ? ` (${sharedTasks.length})` : ''}</AppButton>)}</div>}<div className="weekly-review-list"><h3>Past weekly summaries</h3>{weeklySummaries.some((summary) => summary.tasks?.length > 0) ? weeklySummaries.filter((summary) => summary.tasks?.length > 0).map((summary) => <article className="weekly-summary-row" key={summary.id}><div className="weekly-summary-label"><strong>{fmtDate(`${summary.weekStart}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${summary.weekEnd}T12:00:00`, { month: 'short', day: 'numeric', year: 'numeric' })}</strong><span>{summary.tasks.length} task{summary.tasks.length === 1 ? '' : 's'} completed</span></div><div className="weekly-summary-actions"><AppButton className="text-link" onClick={() => openWeeklySummary(summary)}>View summary</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'word')}>Word document</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'excel')}>Excel workbook</AppButton></div></article>) : <p className="weekly-summary-empty">Your first weekly report will appear here after this week ends.</p>}</div></section>}
-        <section className="task-list" aria-label="Tasks" aria-busy={loading}>{loading ? <TaskListSkeleton /> : error ? <div className="empty" role="alert"><strong>{sessionExpired ? 'Your session has ended' : 'We couldn’t load your tasks'}</strong><span>{sessionExpired ? 'Sign in again to continue. Your saved tasks are still safe.' : userFacingFeedback(error)}</span>{sessionExpired && <AppButton className="save-task" onClick={() => { setAuthMode('login'); setAuthDraft({ email: '', password: '' }); setModal('auth'); }}>Sign in</AppButton>}<AppButton className="secondary-button" onClick={reload}>Try again</AppButton></div> : visibleTasks.length ? visibleTasks.map((task) => <TaskCard key={`${task.shared ? 'shared-' : ''}${task.id}`} task={task} onToggle={!task.shared || task.sharedPermission === 'editor' ? toggleTask : undefined} onEdit={!task.shared || task.sharedPermission === 'editor' ? () => editTask(task) : undefined} onOpen={() => setSelectedTask(task)} onDrop={task.shared ? undefined : moveTask} />) : <div className="empty"><strong>{search ? 'No matching tasks' : view === 'folder' ? 'This folder is empty' : view === 'tag' ? 'No tasks use this tag yet' : view === 'completed' ? 'No completed tasks yet' : view === 'all' && taskScope === 'shared' ? 'No one has shared a task with you yet' : view === 'all' ? 'No tasks planned for this week' : 'No tasks to show'}</strong><span>{view === 'folder' ? 'Create a task in this folder to get started.' : view === 'tag' ? 'Create a task with this tag to get started.' : search ? 'Clear your search or add a new task.' : view === 'all' && taskScope === 'shared' ? 'When someone shares a task with your email, it will appear here.' : view === 'all' ? 'Add this week’s tasks here. Later tasks remain in Upcoming.' : 'Add a task whenever you’re ready.'}</span>{!(view === 'all' && taskScope === 'shared') && <div className="empty-actions"><AppButton className="save-task" onClick={() => startCreateTask({ folder: view === 'folder' ? selectedFolder : '', tag: view === 'tag' ? selectedTag : '' })}>Create task</AppButton></div>}</div>}</section>
-      </> : <CalendarView tasks={tasks} googleEvents={googleCalendarEvents} month={month} setMonth={setMonth} selectedDay={selectedDay} setSelectedDay={setSelectedDay} onDrop={moveTask} onCreate={(day = selectedDay) => { setSelectedDay(day); setMonth(new Date(`${day}T12:00:00`)); startCreateTask({ start: day, due: `${day}T09:00` }); }} onOpen={setSelectedTask} onToggle={toggleTask} onEdit={editTask} />}
+        <section className="task-list" aria-label="Tasks" aria-busy={loading}>{loading ? <TaskListSkeleton /> : error ? <div className="empty" role="alert"><strong>{sessionExpired ? 'Your session has ended' : 'We couldn’t load your tasks'}</strong><span>{sessionExpired ? 'Sign in again to continue. Your saved tasks are still safe.' : userFacingFeedback(error)}</span>{sessionExpired && <AppButton className="save-task" onClick={() => { setAuthMode('login'); setAuthDraft({ email: '', password: '' }); setModal('auth'); }}>Sign in</AppButton>}<AppButton className="secondary-button" onClick={reload}>Try again</AppButton></div> : visibleTasks.length ? visibleTasks.map((task) => <TaskCard key={`${task.shared ? 'shared-' : ''}${task.id}`} task={task} onToggle={!task.shared || task.sharedPermission === 'editor' ? toggleTask : undefined} onEdit={!task.shared || task.sharedPermission === 'editor' ? editTask : undefined} onOpen={openTask} onDrop={task.shared ? undefined : moveTask} />) : <div className="empty"><strong>{search ? 'No matching tasks' : view === 'folder' ? 'This folder is empty' : view === 'tag' ? 'No tasks use this tag yet' : view === 'completed' ? 'No completed tasks yet' : view === 'all' && taskScope === 'shared' ? 'No one has shared a task with you yet' : view === 'all' ? 'No tasks planned for this week' : 'No tasks to show'}</strong><span>{view === 'folder' ? 'Create a task in this folder to get started.' : view === 'tag' ? 'Create a task with this tag to get started.' : search ? 'Clear your search or add a new task.' : view === 'all' && taskScope === 'shared' ? 'When someone shares a task with your email, it will appear here.' : view === 'all' ? 'Add this week’s tasks here. Later tasks remain in Upcoming.' : 'Add a task whenever you’re ready.'}</span>{!(view === 'all' && taskScope === 'shared') && <div className="empty-actions"><AppButton className="save-task" onClick={() => startCreateTask({ folder: view === 'folder' ? selectedFolder : '', tag: view === 'tag' ? selectedTag : '' })}>Create task</AppButton></div>}</div>}</section>
+      </> : <CalendarView tasks={tasks} googleEvents={googleCalendarEvents} month={month} setMonth={setMonth} selectedDay={selectedDay} setSelectedDay={setSelectedDay} onDrop={moveTask} onCreate={(day = selectedDay) => { setSelectedDay(day); setMonth(new Date(`${day}T12:00:00`)); startCreateTask({ start: day, due: `${day}T09:00` }); }} onOpen={openTask} onToggle={toggleTask} onEdit={editTask} />}
     </main>
 
     <aside className={`notes-drawer ${modal === 'notes' ? 'open' : ''}`}><div className="drawer-head"><h2>Notes</h2><AppButton className="iconbtn" aria-label="Close notes" onClick={() => setModal(null)}>×</AppButton></div><AppButton className="add-inline" onClick={() => { setNoteDraft({ title: '', text: '' }); setNoteFormat('bullets'); setNoteEditId(null); setModal('note'); }}>＋ Write a note</AppButton>{notes.length ? notes.map((note) => <article className="note-card" key={note.id}><div className="note-top"><strong>{note.title || 'Quick note'}</strong><div><AppButton className="note-del" title="Edit note" onClick={() => editNote(note)}>✎</AppButton><AppButton className="note-del" title="Delete note" loading={busyAction === `delete-note-${note.id}`} onClick={() => removeNote(note)}>×</AppButton></div></div><div className="note-date">{fmtDate(note.createdAt)}</div><p>{note.text}</p></article>) : <div className="empty mini-empty"><strong>No notes yet</strong><span>Write a note to keep an idea handy.</span><AppButton className="save-task" onClick={() => { setNoteDraft({ title: '', text: '' }); setNoteFormat('bullets'); setNoteEditId(null); setModal('note'); }}>Create note</AppButton></div>}</aside>
@@ -1339,7 +1372,7 @@ function GuestReminderPage({ token }) {
   </main>;
 }
 
-function TaskCard({ task, onToggle, onEdit, onOpen, onDrop }) {
+const TaskCard = React.memo(function TaskCard({ task, onToggle, onEdit, onOpen, onDrop }) {
   const [dragging, setDragging] = useState(false);
   const [toggling, setToggling] = useState(false);
   async function handleToggle(event) {
@@ -1349,10 +1382,10 @@ function TaskCard({ task, onToggle, onEdit, onOpen, onDrop }) {
     finally { setToggling(false); }
   }
   const overdue = task.due && new Date(task.due) < new Date() && task.status !== 'Completed';
-  return <article className={`task ${task.status === 'Completed' ? 'completed' : ''} ${dragging ? 'dragging' : ''} ${toggling ? 'is-toggling' : ''}`} draggable={Boolean(onDrop) && !toggling} onDragStart={(event) => { event.dataTransfer.setData('text/plain', task.id); setDragging(true); }} onDragEnd={() => setDragging(false)} onDragOver={(event) => { if (onDrop) event.preventDefault(); }} onDrop={(event) => { event.preventDefault(); onDrop?.(event.dataTransfer.getData('text/plain'), task.id); }} onClick={onOpen}>
-    <TextInput className="check" type="checkbox" checked={task.status === 'Completed'} disabled={toggling || !onToggle} onClick={(event) => event.stopPropagation()} onChange={handleToggle} aria-label="Mark task complete" aria-busy={toggling} /><div className="task-body"><div className="task-title">{task.title}</div>{task.shared && <small className="shared-task-label">Shared · {task.sharedPermission === 'editor' ? 'Editor access' : 'View only'}</small>}{task.description && <div className="task-desc">{task.description}</div>}<div className="task-meta"><span className={`pill priority-${(task.priority || 'medium').toLowerCase()}`}>{task.priority}</span>{!['To Do', 'Completed'].includes(task.status) && <span className={`pill status ${task.status === 'Acknowledged' ? 'acknowledged' : ''}`}>{task.status}</span>}{(task.tags || []).slice(0, 2).map((tag) => <span className="pill tag" key={tag}>{tag}</span>)}{task.folder && <span className="pill">▱ {task.folder}</span>}{task.due && <span className={`due ${overdue ? 'overdue' : ''}`}>◷ {fmtDate(task.due)}{task.due.includes('T') ? ` · ${fmtDate(task.due, { hour: 'numeric', minute: '2-digit' })}` : ''}</span>}{task.subtasks?.length > 0 && <span className="subcount">☷ {task.subtasks.filter((item) => Boolean(item.is_completed ?? item.done)).length}/{task.subtasks.length}</span>}{task.attachments?.length > 0 && <span className="subcount">⌁ {task.attachments.length}</span>}{task.recurrence && <span className="subcount">↻ {task.recurrence}</span>}{task.emailReminder && <span className="subcount">✉ Email reminder</span>}</div></div>{onEdit && <AppButton className="task-quick" title="Edit task" onClick={(event) => { event.stopPropagation(); onEdit(); }}>···</AppButton>}
+  return <article className={`task ${task.status === 'Completed' ? 'completed' : ''} ${dragging ? 'dragging' : ''} ${toggling ? 'is-toggling' : ''}`} draggable={Boolean(onDrop) && !toggling} onDragStart={(event) => { event.dataTransfer.setData('text/plain', task.id); setDragging(true); }} onDragEnd={() => setDragging(false)} onDragOver={(event) => { if (onDrop) event.preventDefault(); }} onDrop={(event) => { event.preventDefault(); onDrop?.(event.dataTransfer.getData('text/plain'), task.id); }} onClick={() => onOpen?.(task)}>
+    <TextInput className="check" type="checkbox" checked={task.status === 'Completed'} disabled={toggling || !onToggle} onClick={(event) => event.stopPropagation()} onChange={handleToggle} aria-label="Mark task complete" aria-busy={toggling} /><div className="task-body"><div className="task-title">{task.title}</div>{task.shared && <small className="shared-task-label">Shared · {task.sharedPermission === 'editor' ? 'Editor access' : 'View only'}</small>}{task.description && <div className="task-desc">{task.description}</div>}<div className="task-meta"><span className={`pill priority-${(task.priority || 'medium').toLowerCase()}`}>{task.priority}</span>{!['To Do', 'Completed'].includes(task.status) && <span className={`pill status ${task.status === 'Acknowledged' ? 'acknowledged' : ''}`}>{task.status}</span>}{(task.tags || []).slice(0, 2).map((tag) => <span className="pill tag" key={tag}>{tag}</span>)}{task.folder && <span className="pill">▱ {task.folder}</span>}{task.due && <span className={`due ${overdue ? 'overdue' : ''}`}>◷ {fmtDate(task.due)}{task.due.includes('T') ? ` · ${fmtDate(task.due, { hour: 'numeric', minute: '2-digit' })}` : ''}</span>}{task.subtasks?.length > 0 && <span className="subcount">☷ {task.subtasks.filter((item) => Boolean(item.is_completed ?? item.done)).length}/{task.subtasks.length}</span>}{task.attachments?.length > 0 && <span className="subcount">⌁ {task.attachments.length}</span>}{task.recurrence && <span className="subcount">↻ {task.recurrence}</span>}{task.emailReminder && <span className="subcount">✉ Email reminder</span>}</div></div>{onEdit && <AppButton className="task-quick" title="Edit task" onClick={(event) => { event.stopPropagation(); onEdit(task); }}>···</AppButton>}
   </article>;
-}
+});
 
 function CalendarView({ tasks, googleEvents = [], month, setMonth, selectedDay, setSelectedDay, onCreate, onOpen, onToggle, onEdit, onDrop }) {
   const year = month.getFullYear(); const monthIndex = month.getMonth();
@@ -1360,14 +1393,26 @@ function CalendarView({ tasks, googleEvents = [], month, setMonth, selectedDay, 
   const days = new Date(year, monthIndex + 1, 0).getDate(); const previous = new Date(year, monthIndex, 0).getDate();
   const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const cells = Array.from({ length: 42 }, (_, index) => { const n = index - offset + 1; const date = new Date(year, monthIndex, n); return { iso: isoDate(date), day: n < 1 ? previous + n : n > days ? n - days : n, inMonth: n > 0 && n <= days }; });
-  const dayTasks = tasks.filter((task) => task.due?.slice(0, 10) === selectedDay);
-  const dayEvents = googleEvents.filter((event) => event.start?.slice(0, 10) === selectedDay || (event.allDay && selectedDay >= event.start && selectedDay < event.end));
+  const tasksByDate = new Map();
+  tasks.forEach((task) => { const date = task.due?.slice(0, 10); if (date) { const rows = tasksByDate.get(date); if (rows) rows.push(task); else tasksByDate.set(date, [task]); } });
+  const eventsByDate = new Map();
+  googleEvents.forEach((event) => {
+    const startDate = event.start?.slice(0, 10);
+    if (!startDate) return;
+    if (event.allDay && event.end) {
+      for (let cursor = new Date(`${startDate}T12:00:00`), end = new Date(`${event.end.slice(0, 10)}T12:00:00`); cursor < end; cursor.setDate(cursor.getDate() + 1)) {
+        const date = isoDate(cursor); const events = eventsByDate.get(date); if (events) events.push(event); else eventsByDate.set(date, [event]);
+      }
+    } else { const events = eventsByDate.get(startDate); if (events) events.push(event); else eventsByDate.set(startDate, [event]); }
+  });
+  const dayTasks = tasksByDate.get(selectedDay) || [];
+  const dayEvents = eventsByDate.get(selectedDay) || [];
   const changeMonth = (amount) => { const next = new Date(year, monthIndex + amount, 1); setMonth(next); setSelectedDay(isoDate(next)); };
   const eventTime = (event) => event.allDay ? 'All day' : `${fmtDate(event.start, { hour: 'numeric', minute: '2-digit' })} – ${fmtDate(event.end, { hour: 'numeric', minute: '2-digit' })}`;
   return <section className="calendar-view"><div className="calendar-header"><AppButton className="iconbtn" aria-label="Previous month" onClick={() => changeMonth(-1)}>‹</AppButton><strong>{fmtDate(month, { month: 'long', year: 'numeric' })}</strong><AppButton className="iconbtn" aria-label="Next month" onClick={() => changeMonth(1)}>›</AppButton><AppButton className="calendar-today" onClick={() => { const current = new Date(); setMonth(new Date(current.getFullYear(), current.getMonth(), 1)); setSelectedDay(localToday()); }}>Today</AppButton></div>
     {googleEvents.length > 0 && <div className="google-calendar-legend"><span aria-hidden="true" /> Google Calendar events</div>}
-    <div className="calendar-grid">{weekdays.map((day) => <div className="cal-weekday" key={day}>{day}</div>)}{cells.map(({ iso, day, inMonth }) => { const rows = tasks.filter((task) => task.due?.slice(0, 10) === iso); const events = googleEvents.filter((event) => event.start?.slice(0, 10) === iso || (event.allDay && iso >= event.start && iso < event.end)); return <div role="button" tabIndex="0" className={`cal-day ${inMonth ? '' : 'outside'} ${iso === selectedDay ? 'selected' : ''} ${iso === localToday() ? 'is-today' : ''}`} key={iso} onClick={() => onCreate(iso)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') onCreate(iso); }}><span>{day}</span>{rows.slice(0, 3).map((task) => <AppButton type="button" className="cal-task" key={task.id} title={`${task.title} · ${fmtDate(task.due, { year: 'numeric', month: 'long', day: 'numeric' })}`} onClick={(event) => { event.stopPropagation(); onOpen(task); }}>{task.title}<span className="hover-date">{fmtDate(task.due, { month: 'short', day: 'numeric' })}</span></AppButton>)}{events.slice(0, 2).map((event) => event.htmlLink ? <AppButton type="button" className="cal-google-event" key={event.id} title={`${event.title} · ${eventTime(event)}`} onClick={(click) => { click.stopPropagation(); window.open(event.htmlLink, '_blank', 'noopener,noreferrer'); }}>{event.title}<span className="hover-date">{eventTime(event)}</span></AppButton> : <div className="cal-google-event cal-google-event-static" key={event.id} title={`${event.title} · ${eventTime(event)}`}>{event.title}<span className="hover-date">{eventTime(event)}</span></div>)}{rows.length + events.length > 5 && <span className="cal-more">+{rows.length + events.length - 5} more</span>}</div>; })}</div>
-    <div className="day-agenda"><div className="agenda-head"><h2>{fmtDate(`${selectedDay}T12:00:00`, { weekday: 'long', month: 'long', day: 'numeric' })}</h2></div><div className="agenda-list">{dayTasks.map((task) => <TaskCard key={task.id} task={task} onToggle={onToggle} onEdit={() => onEdit(task)} onOpen={() => onOpen(task)} onDrop={onDrop} />)}{dayEvents.map((event) => event.htmlLink ? <a className="google-event-agenda" key={event.id} href={event.htmlLink} target="_blank" rel="noreferrer"><span className="google-event-dot" /><span><strong>{event.title}</strong><small>{eventTime(event)}</small></span><span aria-hidden="true">↗</span></a> : <div className="google-event-agenda google-event-static" key={event.id}><span className="google-event-dot" /><span><strong>{event.title}</strong><small>{eventTime(event)}</small></span></div>)}{!dayTasks.length && !dayEvents.length && <div className="empty"><strong>No tasks or events this day</strong><span>Choose a date to create a task for it.</span></div>}</div></div></section>;
+    <div className="calendar-grid">{weekdays.map((day) => <div className="cal-weekday" key={day}>{day}</div>)}{cells.map(({ iso, day, inMonth }) => { const rows = tasksByDate.get(iso) || []; const events = eventsByDate.get(iso) || []; const today = iso === localToday(); return <div role="button" tabIndex="0" className={`cal-day ${inMonth ? '' : 'outside'} ${iso === selectedDay ? 'selected' : ''} ${today ? 'is-today' : ''}`} key={iso} onClick={() => onCreate(iso)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') onCreate(iso); }}><span>{day}</span>{rows.slice(0, 3).map((task) => <AppButton type="button" className="cal-task" key={task.id} title={`${task.title} · ${fmtDate(task.due, { year: 'numeric', month: 'long', day: 'numeric' })}`} onClick={(event) => { event.stopPropagation(); onOpen(task); }}>{task.title}<span className="hover-date">{fmtDate(task.due, { month: 'short', day: 'numeric' })}</span></AppButton>)}{events.slice(0, 2).map((event) => event.htmlLink ? <AppButton type="button" className="cal-google-event" key={event.id} title={`${event.title} · ${eventTime(event)}`} onClick={(click) => { click.stopPropagation(); window.open(event.htmlLink, '_blank', 'noopener,noreferrer'); }}>{event.title}<span className="hover-date">{eventTime(event)}</span></AppButton> : <div className="cal-google-event cal-google-event-static" key={event.id} title={`${event.title} · ${eventTime(event)}`}>{event.title}<span className="hover-date">{eventTime(event)}</span></div>)}{rows.length + events.length > 5 && <span className="cal-more">+{rows.length + events.length - 5} more</span>}</div>; })}</div>
+    <div className="day-agenda"><div className="agenda-head"><h2>{fmtDate(`${selectedDay}T12:00:00`, { weekday: 'long', month: 'long', day: 'numeric' })}</h2></div><div className="agenda-list">{dayTasks.map((task) => <TaskCard key={task.id} task={task} onToggle={onToggle} onEdit={onEdit} onOpen={onOpen} onDrop={onDrop} />)}{dayEvents.map((event) => event.htmlLink ? <a className="google-event-agenda" key={event.id} href={event.htmlLink} target="_blank" rel="noreferrer"><span className="google-event-dot" /><span><strong>{event.title}</strong><small>{eventTime(event)}</small></span><span aria-hidden="true">↗</span></a> : <div className="google-event-agenda google-event-static" key={event.id}><span className="google-event-dot" /><span><strong>{event.title}</strong><small>{eventTime(event)}</small></span></div>)}{!dayTasks.length && !dayEvents.length && <div className="empty"><strong>No tasks or events this day</strong><span>Choose a date to create a task for it.</span></div>}</div></div></section>;
 }
 function TaskDetail({ task, authUser, onInvite, onClose, onEdit, onToggle, onSubtask, onDelete, deleting = false, toggling = false, savingSubtask = false, onUpdated = () => {} }) {
   const items = task.subtasks || [];
