@@ -17,6 +17,8 @@ export class ReminderService implements OnModuleInit, OnModuleDestroy {
     if (this.running) return;
     this.running = true;
     try {
+      try { await this.auth.processDueTaskNotifications(); }
+      catch (error) { this.logger.error('Could not process task notifications; scheduled email reminders will continue.', error instanceof Error ? error.stack : String(error)); }
       for (const action of await this.auth.claimDueActions()) {
         const appName = process.env.APP_NAME || 'Spectre';
         try {

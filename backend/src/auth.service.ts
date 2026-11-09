@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import { SupabaseStore, ScopeContext } from './store';
 import { SupabaseService } from './supabase.service';
+import { PushService } from './push.service';
 
 type SessionCookie = { access_token: string; refresh_token: string };
 type GuestAccount = { id: string; device_id: string; created_at: string };
@@ -13,7 +14,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
   private readonly guestRequestWindows = new Map<string, { startedAt: number; count: number }>();
-  constructor(private readonly supabase: SupabaseService, private readonly store: SupabaseStore) {}
+  constructor(private readonly supabase: SupabaseService, private readonly store: SupabaseStore, private readonly push: PushService) {}
 
   async identityFromCookie(cookieHeader: string | undefined) {
     const raw = this.readCookie(cookieHeader, 'spectre_session');
@@ -351,10 +352,133 @@ export class AuthService {
     return this.notificationFromRow(data);
   }
 
-  async listNotifications(userId: string) {
-    const { data, error } = await this.supabase.db.from('notifications').select('*').eq('recipient_user_id', userId).order('created_at', { ascending: false }).limit(50);
-    if (error) throw new ServiceUnavailableException(`Could not load notifications: ${error.message}`);
-    return { notifications: data.map((row) => this.notificationFromRow(row)), unreadCount: data.filter((row) => !row.read_at).length };
+  async listNotifications(userId: string, offset = 0) {
+    const start = Math.max(0, Math.floor(offset));
+    const [page, unread] = await Promise.all([
+      this.supabase.db.from('notifications').select('*').eq('recipient_user_id', userId).order('created_at', { ascending: false }).range(start, start + 49),
+      this.supabase.db.from('notifications').select('id', { count: 'exact', head: true }).eq('recipient_user_id', userId).is('read_at', null),
+    ]);
+    if (page.error || unread.error) throw new ServiceUnavailableException('Could not load notifications.');
+    return { notifications: page.data.map((row) => this.notificationFromRow(row)), unreadCount: unread.count || 0, hasMore: page.data.length === 50 };
+  }
+
+  async listGuestNotifications(scope: string, offset = 0) {
+    const start = Math.max(0, Math.floor(offset));
+    const [page, unread] = await Promise.all([
+      this.supabase.db.from('notifications').select('*').eq('recipient_scope', scope).order('created_at', { ascending: false }).range(start, start + 49),
+      this.supabase.db.from('notifications').select('id', { count: 'exact', head: true }).eq('recipient_scope', scope).is('read_at', null),
+    ]);
+    if (page.error || unread.error) throw new ServiceUnavailableException('Could not load notifications.');
+    return { notifications: page.data.map((row) => this.notificationFromRow(row)), unreadCount: unread.count || 0, hasMore: page.data.length === 50 };
+  }
+
+  async markGuestNotificationRead(scope: string, id: string) {
+    const { data, error } = await this.supabase.db.from('notifications').update({ read_at: new Date().toISOString() }).eq('id', id).eq('recipient_scope', scope).is('read_at', null).select('*').maybeSingle();
+    if (error) throw new ServiceUnavailableException(`Could not update notification: ${error.message}`);
+    if (data) return this.notificationFromRow(data);
+    const { data: existing, error: lookupError } = await this.supabase.db.from('notifications').select('*').eq('id', id).eq('recipient_scope', scope).maybeSingle();
+    if (lookupError) throw new ServiceUnavailableException(`Could not load notification: ${lookupError.message}`);
+    if (!existing) throw new NotFoundException('Notification not found.');
+    return this.notificationFromRow(existing);
+  }
+
+  async markGuestNotificationsRead(scope: string) {
+    const { error } = await this.supabase.db.from('notifications').update({ read_at: new Date().toISOString() }).eq('recipient_scope', scope).is('read_at', null);
+    if (error) throw new ServiceUnavailableException(`Could not update notifications: ${error.message}`);
+    return { status: 'ok' };
+  }
+
+  async getNotificationPreferences(scope: string) {
+    const { data, error } = await this.supabase.db.from('notification_preferences').select('*').eq('owner_scope', scope).maybeSingle();
+    if (error) throw new ServiceUnavailableException(`Could not load notification settings: ${error.message}`);
+    return this.notificationPreferencesFromRow(data);
+  }
+
+  async updateNotificationPreferences(scope: string, input: Record<string, unknown>) {
+    const current = await this.getNotificationPreferences(scope);
+    const next = {
+      owner_scope: scope,
+      in_app: typeof input.inApp === 'boolean' ? input.inApp : current.inApp,
+      browser_push: typeof input.browserPush === 'boolean' ? input.browserPush : current.browserPush,
+      task_reminders: typeof input.taskReminders === 'boolean' ? input.taskReminders : current.taskReminders,
+      collaboration_updates: typeof input.collaborationUpdates === 'boolean' ? input.collaborationUpdates : current.collaborationUpdates,
+      updated_at: new Date().toISOString(),
+    };
+    const { data, error } = await this.supabase.db.from('notification_preferences').upsert(next, { onConflict: 'owner_scope' }).select('*').single();
+    if (error) throw new ServiceUnavailableException(`Could not save notification settings: ${error.message}`);
+    return this.notificationPreferencesFromRow(data);
+  }
+
+  async savePushSubscription(scope: string, input: Record<string, any>) {
+    if (!this.push.available) throw new BadRequestException('Browser notifications are not available right now.');
+    const endpoint = typeof input.endpoint === 'string' ? input.endpoint : '';
+    const p256dh = typeof input.keys?.p256dh === 'string' ? input.keys.p256dh : '';
+    const auth = typeof input.keys?.auth === 'string' ? input.keys.auth : '';
+    if (endpoint.length > 2048 || p256dh.length > 256 || auth.length > 128) throw new BadRequestException('This browser notification subscription is not valid.');
+    let parsed: URL;
+    try { parsed = new URL(endpoint); } catch { throw new BadRequestException('This browser notification subscription is not valid.'); }
+    if (parsed.protocol !== 'https:' || !parsed.hostname || /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[::1\])/i.test(parsed.hostname)) throw new BadRequestException('This browser notification subscription is not valid.');
+    if (!p256dh || !auth) throw new BadRequestException('This browser did not provide the required notification keys.');
+    const { error } = await this.supabase.db.from('push_subscriptions').upsert({ owner_scope: scope, endpoint, p256dh, auth, updated_at: new Date().toISOString() }, { onConflict: 'endpoint' });
+    if (error) throw new ServiceUnavailableException('Could not save browser notification settings.');
+    const { error: prefError } = await this.supabase.db.from('notification_preferences').upsert({ owner_scope: scope, browser_push: true, updated_at: new Date().toISOString() }, { onConflict: 'owner_scope' });
+    if (prefError) throw new ServiceUnavailableException('Could not save browser notification settings.');
+    return { status: 'ok' };
+  }
+
+  async removePushSubscription(scope: string, endpoint?: string) {
+    let query = this.supabase.db.from('push_subscriptions').delete().eq('owner_scope', scope);
+    if (endpoint) query = query.eq('endpoint', endpoint);
+    const { error } = await query;
+    if (error) throw new ServiceUnavailableException('Could not turn off browser notifications.');
+    if (!endpoint) {
+      const { error: prefError } = await this.supabase.db.from('notification_preferences').upsert({ owner_scope: scope, browser_push: false, updated_at: new Date().toISOString() }, { onConflict: 'owner_scope' });
+      if (prefError) throw new ServiceUnavailableException('Could not turn off browser notifications.');
+    }
+    return { status: 'ok' };
+  }
+
+  async processDueTaskNotifications() {
+    const { data: owners, error } = await this.supabase.db.from('spectre_data').select('owner_key,data,revision');
+    if (error) throw new ServiceUnavailableException(`Could not check task reminders: ${error.message}`);
+    const now = Date.now();
+    for (const owner of owners || []) {
+      const tasks: Record<string, any>[] = Array.isArray(owner.data?.tasks) ? owner.data.tasks : [];
+      const { data: savedPreferences, error: preferencesError } = await this.supabase.db.from('notification_preferences').select('in_app,browser_push,task_reminders').eq('owner_scope', owner.owner_key).maybeSingle();
+      if (preferencesError) throw new ServiceUnavailableException(`Could not check notification settings: ${preferencesError.message}`);
+      const remindersEnabled = ((savedPreferences?.in_app ?? true) || (savedPreferences?.browser_push ?? false)) && (savedPreferences?.task_reminders ?? true);
+      let changed = false;
+      for (const task of tasks) {
+        if (!task.reminder || !task.due || task.status === 'Completed' || task.notified) continue;
+        const dueAt = Date.parse(task.reminderAt || task.due);
+        const leadMs = task.reminder === 'at-due' ? 0 : Number(task.reminder) * 60_000;
+        if (!Number.isFinite(dueAt) || !Number.isFinite(leadMs) || dueAt - leadMs > now) continue;
+        let dueLabel = new Date(dueAt).toISOString();
+        try { dueLabel = new Intl.DateTimeFormat('en', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: task.reminderTimezone || 'UTC' }).format(new Date(dueAt)); } catch {}
+        const reminderMessage = `This task is due ${task.reminder === 'at-due' ? 'now' : 'soon'} (scheduled for ${dueLabel}).`;
+        const dedupeKey = `task-reminder:${owner.owner_key}:${task.id}:${task.due}:${task.reminder}`;
+        if (remindersEnabled) {
+          const { error: insertError } = await this.supabase.db.from('notifications').insert({
+          recipient_user_id: owner.owner_key.startsWith('user:') ? owner.owner_key.slice(5) : null,
+          recipient_scope: owner.owner_key,
+          notification_type: 'task_reminder',
+          title: task.title || 'Task reminder',
+          message: reminderMessage,
+          related_task_id: task.id,
+          dedupe_key: dedupeKey,
+          push_next_attempt_at: savedPreferences?.browser_push ? new Date().toISOString() : null,
+          });
+          if (insertError && insertError.code !== '23505') throw new ServiceUnavailableException(`Could not save a task reminder: ${insertError.message}`);
+        }
+        task.notified = true;
+        changed = true;
+      }
+      if (changed) {
+        const { error: updateError } = await this.supabase.db.from('spectre_data').update({ data: owner.data, revision: owner.revision + 1, updated_at: new Date().toISOString() }).eq('owner_key', owner.owner_key).eq('revision', owner.revision);
+        if (updateError) this.logger.warn(`Could not mark due reminders as processed for ${owner.owner_key}: ${updateError.message}`);
+      }
+    }
+    await this.processPendingPushNotifications();
   }
 
   async markNotificationRead(userId: string, id: string) {
@@ -384,6 +508,48 @@ export class AuthService {
     if (task?.status === 'To Do') { task.status = 'Pending'; await this.store.write(data, scope); }
   }
   private notificationFromRow(row: any) { return { id: row.id, recipientUserId: row.recipient_user_id, type: row.notification_type, title: row.title, message: row.message, relatedTaskId: row.related_task_id || null, relatedScheduledActionId: row.related_scheduled_action_id, readAt: row.read_at ? Date.parse(row.read_at) : null, createdAt: Date.parse(row.created_at) }; }
+  private notificationPreferencesFromRow(row: any) { return { inApp: row?.in_app ?? true, browserPush: row?.browser_push ?? false, taskReminders: row?.task_reminders ?? true, collaborationUpdates: row?.collaboration_updates ?? true, browserPushAvailable: this.push.available, browserPushPublicKey: this.push.publicKey }; }
+  private async processPendingPushNotifications() {
+    if (!this.push.available) return;
+    const now = new Date().toISOString();
+    const { data: due, error } = await this.supabase.db.from('notifications').select('id,recipient_scope,title,message,related_task_id,push_attempt_count,push_next_attempt_at').eq('notification_type', 'task_reminder').is('push_sent_at', null).not('push_next_attempt_at', 'is', null).lte('push_next_attempt_at', now).limit(100);
+    if (error) throw new ServiceUnavailableException('Could not check pending browser notifications.');
+    for (const item of due || []) {
+      const attempts = Number(item.push_attempt_count) || 0;
+      const leaseUntil = new Date(Date.now() + 60_000).toISOString();
+      const { data: claimed, error: claimError } = await this.supabase.db.from('notifications').update({ push_attempt_count: attempts + 1, push_next_attempt_at: leaseUntil }).eq('id', item.id).eq('push_attempt_count', attempts).is('push_sent_at', null).lte('push_next_attempt_at', now).select('id').maybeSingle();
+      if (claimError || !claimed) continue;
+      const { data: prefs, error: preferenceError } = await this.supabase.db.from('notification_preferences').select('browser_push').eq('owner_scope', item.recipient_scope).maybeSingle();
+      if (!preferenceError && !prefs?.browser_push) {
+        await this.supabase.db.from('notifications').update({ push_sent_at: new Date().toISOString(), push_next_attempt_at: null }).eq('id', item.id);
+        continue;
+      }
+      const result = preferenceError ? { subscriptions: 1, failed: 1 } : await this.sendPushToOwner(item.recipient_scope, { title: item.title, body: item.message, taskId: item.related_task_id });
+      if (result.failed === 0 || result.subscriptions === 0) {
+        await this.supabase.db.from('notifications').update({ push_sent_at: new Date().toISOString(), push_next_attempt_at: null, push_failure_reason: null }).eq('id', item.id);
+      } else if (attempts + 1 >= 5) {
+        await this.supabase.db.from('notifications').update({ push_sent_at: new Date().toISOString(), push_next_attempt_at: null, push_failure_reason: 'Browser notification could not be delivered after several attempts.' }).eq('id', item.id);
+      } else {
+        const retryAt = new Date(Date.now() + Math.min(60_000 * (2 ** attempts), 30 * 60_000)).toISOString();
+        await this.supabase.db.from('notifications').update({ push_next_attempt_at: retryAt, push_failure_reason: 'Temporary browser notification delivery issue.' }).eq('id', item.id);
+      }
+    }
+  }
+
+  private async sendPushToOwner(ownerScope: string, message: { title: string; body: string; taskId: string }) {
+    const { data, error } = await this.supabase.db.from('push_subscriptions').select('endpoint,p256dh,auth').eq('owner_scope', ownerScope);
+    if (error) { this.logger.warn('Could not load browser notification subscriptions.'); return { subscriptions: 0, failed: 1 }; }
+    let failed = 0;
+    const subscriptions = data || [];
+    for (const subscription of data || []) {
+      try {
+        const result = await this.push.send(subscription, message);
+        if (result.gone) await this.supabase.db.from('push_subscriptions').delete().eq('endpoint', subscription.endpoint);
+        if (!result.sent && !result.gone) failed += 1;
+      } catch (error) { failed += 1; this.logger.warn(`Browser notification delivery failed: ${error instanceof Error ? error.message : 'unknown error'}`); }
+    }
+    return { subscriptions: subscriptions.length, failed };
+  }
   private cleanGuestToken(value: unknown) {
     if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{40,64}$/.test(value)) throw new NotFoundException('This reminder link is invalid, expired, or revoked.');
     return value;

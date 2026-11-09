@@ -83,7 +83,7 @@ const api = async (path, options = {}) => {
     throw new Error('Unable to connect to Spectre. Check your internet connection and try again.');
   }
   const payload = response.status === 204 ? null : await response.json().catch(() => null);
-  if (!response.ok) throw new Error(userFacingApiError(payload?.message, response.status));
+  if (!response.ok) { const error = new Error(userFacingApiError(payload?.message, response.status)); error.status = response.status; throw error; }
   return payload;
 };
 const resolveGuestAccount = () => {
@@ -258,6 +258,9 @@ function App() {
   const [scheduledActions, setScheduledActions] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
+  const [notificationHasMore, setNotificationHasMore] = useState(false);
+  const [loadingMoreNotifications, setLoadingMoreNotifications] = useState(false);
+  const [notificationPreferences, setNotificationPreferences] = useState({ inApp: true, browserPush: false, taskReminders: true, collaborationUpdates: true, browserPushAvailable: false });
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationsRef = useRef(null);
   const notificationTriggerRef = useRef(null);
@@ -275,7 +278,6 @@ function App() {
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [feedback, setFeedback] = useState({ kind: 'success', title: '', message: '' });
   const [confirmation, setConfirmation] = useState(null);
-  const [dueAlert, setDueAlert] = useState(null);
   const [taskDraft, setTaskDraft] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
@@ -290,12 +292,20 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState('');
   const [error, setError] = useState('');
-  const [toast, setToast] = useState('');
+  const [sessionExpired, setSessionExpired] = useState(false);
+  const [toast, setToast] = useState(null);
+  const toastTimerRef = useRef(null);
+  const lastToastRef = useRef({ message: '', at: 0 });
+  const [isOnline, setIsOnline] = useState(() => navigator.onLine !== false);
   const [dark, setDark] = useState(() => localStorage.getItem('spectre.theme') === 'dark');
 
-  const notify = useCallback((message) => {
-    setToast(message);
-    window.setTimeout(() => setToast(''), 2600);
+  const notify = useCallback((message, kind = 'info', action) => {
+    const now = Date.now();
+    if (lastToastRef.current.message === message && now - lastToastRef.current.at < 1800) return;
+    lastToastRef.current = { message, at: now };
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    setToast({ id: now, kind, message, action });
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 4200);
   }, []);
   const showFeedback = useCallback((kind, message, title) => {
     setFeedback({ kind, message: kind === 'error' ? userFacingFeedback(message) : message, title: title || (kind === 'success' ? 'Success' : 'Something went wrong') });
@@ -306,8 +316,73 @@ function App() {
     const result = await api('/notifications');
     setNotifications(result.notifications || []);
     setUnreadNotificationCount(result.unreadCount || 0);
+    setNotificationHasMore(Boolean(result.hasMore));
     return result;
   }, []);
+
+  const loadMoreNotifications = useCallback(async () => {
+    if (loadingMoreNotifications || !notificationHasMore) return;
+    setLoadingMoreNotifications(true);
+    try {
+      const result = await api(`/notifications?offset=${notifications.length}`);
+      setNotifications((current) => [...current, ...(result.notifications || []).filter((item) => !current.some((existing) => existing.id === item.id))]);
+      setNotificationHasMore(Boolean(result.hasMore));
+      setUnreadNotificationCount(result.unreadCount || 0);
+    } catch (err) { notify(userFacingFeedback(err.message), 'error'); }
+    finally { setLoadingMoreNotifications(false); }
+  }, [loadingMoreNotifications, notificationHasMore, notifications.length, notify]);
+
+  const saveNotificationPreferences = useCallback(async (patch) => {
+    const previous = notificationPreferences;
+    const next = { ...previous, ...patch };
+    setNotificationPreferences(next);
+    try {
+      const saved = await api('/notification-preferences', { method: 'PUT', body: patch });
+      setNotificationPreferences(saved);
+      notify('Notification settings saved.', 'success');
+    } catch (err) {
+      setNotificationPreferences(previous);
+      notify(userFacingFeedback(err.message), 'error');
+    }
+  }, [notificationPreferences, notify]);
+
+  const configureBrowserPush = useCallback(async (enabled) => {
+    if (!enabled) {
+      try {
+        const registration = await navigator.serviceWorker?.getRegistration('/');
+        const subscription = await registration?.pushManager?.getSubscription();
+        if (subscription) {
+          await api('/notifications/push-subscription', { method: 'DELETE', body: { endpoint: subscription.endpoint } });
+          await subscription.unsubscribe();
+        } else await api('/notifications/push-subscription', { method: 'DELETE' });
+        setNotificationPreferences((current) => ({ ...current, browserPush: false }));
+        notify('Browser notifications are turned off.', 'success');
+      } catch (err) { notify(userFacingFeedback(err.message), 'error'); }
+      return;
+    }
+    if (!notificationPreferences.browserPushAvailable || !notificationPreferences.browserPushPublicKey) {
+      notify('Browser notifications are not set up yet. Your inbox reminders will still work in Spectre.', 'info'); return;
+    }
+    if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) {
+      notify('This browser does not support browser notifications. You can still use the Spectre inbox.', 'warning'); return;
+    }
+    try {
+      setBusyAction('push-subscription');
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') throw new Error(permission === 'denied' ? 'Notifications are blocked in your browser settings. Allow them there, then try again.' : 'Notification permission was not granted.');
+      const registration = await navigator.serviceWorker.register('/service-worker.js');
+      const ready = await navigator.serviceWorker.ready;
+      const key = notificationPreferences.browserPushPublicKey.replace(/-/g, '+').replace(/_/g, '/');
+      const rawKey = Uint8Array.from(atob(key + '='.repeat((4 - key.length % 4) % 4)), (character) => character.charCodeAt(0));
+      let subscription = await ready.pushManager.getSubscription();
+      if (!subscription) subscription = await ready.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: rawKey });
+      await api('/notifications/push-subscription', { method: 'POST', body: subscription.toJSON() });
+      setNotificationPreferences((current) => ({ ...current, browserPush: true }));
+      notify('Browser notifications are on. We’ll alert you when a task reminder is due.', 'success');
+      void registration;
+    } catch (err) { notify(userFacingFeedback(err.message), 'error'); }
+    finally { setBusyAction(''); }
+  }, [notificationPreferences, notify]);
 
   const reload = useCallback(async () => {
     const requestId = ++reloadRequestRef.current;
@@ -331,7 +406,11 @@ function App() {
       if (requestId !== reloadRequestRef.current) return;
       if (![nextTasks, nextFolders, nextTags, nextNotes].every(Array.isArray) || !profile?.username) throw new Error('The API returned an unexpected response. Restart the updated NestJS server and try again.');
       setTasks(nextTasks); setFolders(nextFolders); setTags(nextTags); setNotes(nextNotes);
-      setUsername(profile.username); setProfileDraft({ username: profile.username, phone: profile.phone || '', avatarUrl: profile.avatarUrl || '' }); setAuthUser(user); setError('');
+      setUsername(profile.username); setProfileDraft({ username: profile.username, phone: profile.phone || '', avatarUrl: profile.avatarUrl || '' }); setAuthUser(user); setError(''); setSessionExpired(false);
+      try {
+        const preferences = await api('/notification-preferences');
+        if (requestId === reloadRequestRef.current) setNotificationPreferences(preferences);
+      } catch (preferencesError) { console.warn('[Spectre] Could not load notification settings:', preferencesError.message); }
       try {
         const summaries = await api(`/weekly-summaries?timezone=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`);
         if (requestId !== reloadRequestRef.current) return;
@@ -342,17 +421,33 @@ function App() {
           if (Array.isArray(activeTasks)) setTasks(activeTasks);
         }
       } catch (summaryError) { console.warn('[Spectre] Could not refresh weekly summaries:', summaryError.message); }
-      if (user) {
-        try { const result = await api('/notifications'); if (requestId === reloadRequestRef.current) { setNotifications(result.notifications || []); setUnreadNotificationCount(result.unreadCount || 0); } }
+      {
+        try { const result = await api('/notifications'); if (requestId === reloadRequestRef.current) { setNotifications(result.notifications || []); setUnreadNotificationCount(result.unreadCount || 0); setNotificationHasMore(Boolean(result.hasMore)); } }
         catch (notificationError) { console.warn('[Spectre] Could not load notifications:', notificationError.message); }
+      }
+      if (user) {
         try { const status = await api('/google-calendar/status'); if (requestId === reloadRequestRef.current) setGoogleCalendarStatus(status); }
         catch (calendarError) { console.warn('[Spectre] Could not load Google Calendar status:', calendarError.message); setGoogleCalendarStatus({ connected: false, email: null }); }
-      } else { setNotifications([]); setUnreadNotificationCount(0); setGoogleCalendarStatus({ connected: false, email: null }); setGoogleCalendarEvents([]); }
-    } catch (err) { if (requestId === reloadRequestRef.current) setError(err.message); }
+      } else { setGoogleCalendarStatus({ connected: false, email: null }); setGoogleCalendarEvents([]); }
+    } catch (err) { if (requestId === reloadRequestRef.current) { setError(err.message); setSessionExpired(err.status === 401); } }
     finally { if (requestId === reloadRequestRef.current) setLoading(false); }
   }, []);
 
   useEffect(() => { reload(); }, [reload]);
+  useEffect(() => {
+    if (loading) return;
+    const taskId = new URLSearchParams(window.location.search).get('task');
+    if (!taskId) return;
+    const target = [...tasks, ...sharedTasks].find((task) => task.id === taskId);
+    if (target) { setSelectedTask(target); window.history.replaceState({}, '', window.location.pathname); }
+  }, [loading, tasks, sharedTasks]);
+  useEffect(() => {
+    const onOffline = () => { setIsOnline(false); notify('You’re offline. Changes may not sync until you reconnect.', 'warning'); };
+    const onOnline = () => { setIsOnline(true); notify('You’re back online. Refreshing your Spectre data…', 'success'); reload(); };
+    window.addEventListener('offline', onOffline);
+    window.addEventListener('online', onOnline);
+    return () => { window.removeEventListener('offline', onOffline); window.removeEventListener('online', onOnline); };
+  }, [notify, reload]);
   useEffect(() => {
     if (loading || !collaborationToken) return;
     if (!authUser) { if (!inviteAuthPromptedRef.current) { inviteAuthPromptedRef.current = true; setAuthMode('login'); setAuthDraft((draft) => ({ ...draft, email: '' })); setModal('auth'); } return; }
@@ -471,10 +566,10 @@ function App() {
     if (unviewed) { setActiveWeeklySummary(unviewed); setModal('weekly-summary'); }
   }, [weeklySummaries, loading, modal, assistantOpen, selectedTask]);
   useEffect(() => {
-    if (!authUser) return undefined;
+    if (loading) return undefined;
     const timer = window.setInterval(() => { refreshNotifications().catch((err) => console.warn('[Spectre] Could not refresh notifications:', err.message)); }, 30_000);
     return () => window.clearInterval(timer);
-  }, [authUser, refreshNotifications]);
+  }, [loading, refreshNotifications]);
   useEffect(() => { if (pendingReminder) sessionStorage.setItem('spectre.pending-reminder', JSON.stringify(pendingReminder)); else sessionStorage.removeItem('spectre.pending-reminder'); }, [pendingReminder]);
   useEffect(() => { if (!loading && pendingReminder && !modal) setModal(authUser ? (pendingReminder.recipientEmail ? 'reminder-confirm' : 'recipient') : 'auth'); }, [loading, pendingReminder, authUser, modal]);
   useEffect(() => { if (passwordResetToken) setModal('password-reset'); }, [passwordResetToken]);
@@ -492,27 +587,6 @@ function App() {
     document.addEventListener('pointerdown', dismissOutside);
     return () => document.removeEventListener('pointerdown', dismissOutside);
   }, [notificationsOpen]);
-  useEffect(() => {
-    const check = async () => {
-      if (dueAlert || modal) return;
-      const now = Date.now();
-      const task = tasks.find((item) => {
-        if (!item.due || item.status === 'Completed' || item.notified) return false;
-        const due = new Date(item.due).getTime();
-        const lead = !item.reminder || item.reminder === 'at-due' ? 0 : Number(item.reminder) * 60_000;
-        const trigger = due - lead;
-        return trigger <= now && trigger > now - 60_000;
-      });
-      if (task) {
-        try { await api(`/tasks/${task.id}`, { method: 'PATCH', body: { notified: true } }); setDueAlert(task); reload(); }
-        catch (err) { showFeedback('error', err.message); }
-      }
-    };
-    const timer = window.setInterval(check, 15_000);
-    check();
-    return () => window.clearInterval(timer);
-  }, [tasks, dueAlert, modal, showFeedback, reload]);
-
   const visibleTasks = useMemo(() => {
     let rows = view === 'all' && taskScope === 'shared' ? [...sharedTasks] : view === 'all' && taskScope === 'all' ? [...tasks, ...sharedTasks] : [...tasks];
     if (view === 'today') rows = rows.filter((task) => task.status !== 'Completed' && (!task.due || task.due.slice(0, 10) <= localToday()));
@@ -566,7 +640,8 @@ function App() {
     setBusyAction('save-task');
     const parsedReminder = parseReminderRequest(taskDraft.title);
     const { start: _legacyStart, ...taskFields } = taskDraft;
-    const payload = { ...taskFields, ...(parsedReminder ? { title: parsedReminder.title, due: parsedReminder.due, emailReminder: true } : {}), tags: [...new Set(taskDraft.tags.split(',').map((tag) => tag.trim()).filter(Boolean))], attachments: attachmentFiles };
+    const finalDue = parsedReminder?.due || taskDraft.due;
+    const payload = { ...taskFields, ...(parsedReminder ? { title: parsedReminder.title, due: parsedReminder.due, emailReminder: true } : {}), reminderAt: finalDue ? new Date(finalDue).toISOString() : null, reminderTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone, tags: [...new Set(taskDraft.tags.split(',').map((tag) => tag.trim()).filter(Boolean))], attachments: attachmentFiles };
     try {
       if (!editingId && authUser && googleCalendarStatus.connected && taskDraft.due) {
         const conflicts = await api(`/google-calendar/conflicts?due=${encodeURIComponent(new Date(taskDraft.due).toISOString())}&localDate=${encodeURIComponent(taskDraft.due.slice(0, 10))}`);
@@ -583,13 +658,12 @@ function App() {
     const successMessage = editingId ? 'Task updated.' : 'Task created.';
     setModal(null);
     if (!needsEmailReminder) showFeedback('success', successMessage);
-    const refresh = reload();
-    if (needsEmailReminder) await refresh;
     if (taskDraft.emailReminder || parsedReminder) {
       setPendingReminder({ requestId: crypto.randomUUID(), taskId: task.id, title: task.title, scheduledAt: new Date(task.due).toISOString(), message: task.description || task.title, ...(parsedReminder ? { recipientName: parsedReminder.recipientName } : {}) });
       if (parsedReminder) setRecipientDraft({ name: parsedReminder.recipientName, email: '' });
       if (authUser) setModal('recipient'); else { setAuthMode('signup'); setAuthDraft({ email: '', password: '' }); setModal('auth'); }
     }
+    void reload();
     setPendingTaskPayload(null);
   }
   async function confirmCalendarConflict() {
@@ -970,11 +1044,13 @@ function App() {
     ['today', '◷', 'Today', todayCount || ''], ['upcoming', '▦', 'Coming up', ''],
     ['all', '☷', 'This week', tasks.filter((task) => task.status !== 'Completed').length || ''],
     ['completed', '✓', 'Done', ''], ['calendar', '▦', 'Calendar', ''],
+    ['notifications', '♢', 'Notifications', unreadNotificationCount || ''],
   ];
 
   if (loading) return <LoadingSplash />;
 
   return <div className={`app-shell ${navOpen ? 'nav-open' : ''}`}>
+    {!isOnline && <div className="network-status" role="status"><span aria-hidden="true">●</span> You’re offline. Spectre will reconnect when your internet is back.</div>}
     {navOpen && <AppButton className="sidebar-scrim" aria-label="Close navigation" onClick={() => setNavOpen(false)} />}
     <aside className="sidebar">
       <div className="brand"><span className="brand-icon">✓</span><span className="brand-name">Spectre</span></div>
@@ -983,10 +1059,8 @@ function App() {
       {tags.length > 0 && <section className="nav-group"><div className="navgroup-title">Tags</div>{tags.map((tag, index) => <div className="tag-row" key={tag}><AppButton className="tagline" onClick={() => { setSelectedTag(tag); setSelectedFolder(''); setView('tag'); setNavOpen(false); }}><span className={`dot dot-${index % 5}`} />{tag}</AppButton><AppButton className="mini tag-delete" title={`Delete ${tag} tag`} aria-label={`Delete ${tag} tag`} loading={busyAction === `delete-tag-${tag}`} onClick={() => removeTag(tag)}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M4 7h16m-10 4v7m4-7v7M6 7l1 14h10l1-14M9 7V4h6v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/></svg></AppButton></div>)}</section>}
       <div className="sidebar-footer">
         <AppButton className="sidebar-action" onClick={() => { setNavOpen(false); setModal('notes'); }}><span aria-hidden="true">▤</span>Notes</AppButton>
-        {authUser && <AppButton ref={notificationTriggerRef} className="sidebar-action" aria-expanded={notificationsOpen} onClick={async () => { setNavOpen(false); try { setNotifications(await api('/notifications').then((result) => result.notifications || [])); setNotificationsOpen((value) => !value); } catch (err) { showFeedback('error', err.message); } }}><span aria-hidden="true">♢</span>Notifications{unreadNotificationCount > 0 && <span className="count">{unreadNotificationCount}</span>}</AppButton>}
         <AppButton className="sidebar-action" loading={busyAction === 'load-scheduled'} onClick={() => { setNavOpen(false); showScheduledActions(); }}><span aria-hidden="true">◷</span>Scheduled reminders</AppButton>
         <AppButton className="sidebar-action" onClick={() => { setNavOpen(false); setDark((value) => !value); }}><span aria-hidden="true">◐</span>{dark ? 'Light theme' : 'Dark theme'}</AppButton>
-        {notificationsOpen && authUser && <section ref={notificationsRef} className="notification-panel sidebar-notification-panel" aria-label="Notifications"><div className="notification-panel-head"><strong>Notifications</strong>{unreadNotificationCount > 0 && <AppButton className="text-link" onClick={markAllNotificationsRead}>Mark all read</AppButton>}</div>{notifications.length ? notifications.map((notification) => <AppButton key={notification.id} className={`notification-item ${notification.readAt ? '' : 'unread'}`} onClick={() => { setNotificationsOpen(false); openNotification(notification); }}><strong>{notification.title}</strong><span>{notification.message}</span><small>{fmtDate(notification.createdAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></AppButton>) : <div className="notification-empty">You’re all caught up.</div>}</section>}
         <div className="sidebar-account"><AppButton className="account-profile" title="Open profile" onClick={() => changeView('profile')}><span className="account-avatar" aria-hidden="true">{(profileDraft.avatarUrl || authUser?.avatarUrl) ? <img src={profileDraft.avatarUrl || authUser?.avatarUrl} alt="" /> : (username || 'U').slice(0, 1).toUpperCase()}</span><span className="account-identity"><strong>{username}</strong><small>{authUser ? 'Signed in' : 'Guest account'}</small></span></AppButton>{authUser ? <AppButton className="account-signout" title="Sign out" aria-label="Sign out" onClick={() => { setNavOpen(false); setModal('signout-confirm'); }}>↪</AppButton> : <AppButton className="account-signout" title="Sign in" aria-label="Sign in" onClick={() => { setNavOpen(false); setAuthMode('signup'); setModal('auth'); }}>↗</AppButton>}</div>
       </div>
     </aside>
@@ -994,11 +1068,11 @@ function App() {
     <main className={`center ${mobileFiltersOpen ? 'filters-open' : ''}`}>
       <header className="topline"><AppButton className="iconbtn mobile-menu" title="Open navigation" aria-label="Open navigation" aria-expanded={navOpen} onClick={() => setNavOpen((value) => !value)}>☰</AppButton><div className="top-heading"><div className="date-kicker">{fmtDate(new Date(), { weekday: 'long', month: 'long', day: 'numeric' })}</div><h1>{viewTitle[0]}<span>{viewTitle[1]}</span></h1></div><div className="top-actions">{view !== 'profile' && <AppButton className="primary-add" onClick={() => startCreateTask()}>＋ New task</AppButton>}<AppButton className="username-button profile-chip" title="Open profile" onClick={() => changeView('profile')}><span className="profile-chip-avatar">{(profileDraft.avatarUrl || authUser?.avatarUrl) ? <img src={profileDraft.avatarUrl || authUser?.avatarUrl} alt="" /> : (username || 'U').slice(0, 1).toUpperCase()}</span><span>{username}</span></AppButton></div></header>
       <section className="progressbox"><div className="progress-icon">✳</div><div className="progress-copy"><div className="progress-title">{percentDone === 100 ? 'Beautifully done' : tasks.length - totalDone ? `${tasks.length - totalDone} ${tasks.length - totalDone === 1 ? 'task' : 'tasks'} in your hands` : 'A fresh start'}</div><div className="progress-sub">{totalDone ? `${totalDone} ${totalDone === 1 ? 'task' : 'tasks'} completed — keep going.` : 'Small steps make a meaningful day.'}</div></div><div className="progress-track"><div className="progress-fill" style={{ width: `${percentDone}%` }} /></div><div className="progress-num">{percentDone}%</div></section>
-      {view === 'profile' ? <ProfilePage username={username} authUser={authUser} profileDraft={profileDraft} setProfileDraft={setProfileDraft} onUpdate={saveProfile} onPasswordUpdate={savePassword} onAvatarChange={updateProfileImage} busyAction={busyAction} googleCalendarStatus={googleCalendarStatus} onConnectCalendar={connectGoogleCalendar} onDisconnectCalendar={disconnectGoogleCalendar} onSignIn={() => { setAuthMode('signup'); setAuthDraft({ email: '', password: '' }); setModal('auth'); }} onSwitchAccount={() => setModal('switch-account-confirm')} /> : view !== 'calendar' ? <>
+      {view === 'profile' ? <ProfilePage username={username} authUser={authUser} profileDraft={profileDraft} setProfileDraft={setProfileDraft} onUpdate={saveProfile} onPasswordUpdate={savePassword} onAvatarChange={updateProfileImage} busyAction={busyAction} googleCalendarStatus={googleCalendarStatus} onConnectCalendar={connectGoogleCalendar} onDisconnectCalendar={disconnectGoogleCalendar} onSignIn={() => { setAuthMode('signup'); setAuthDraft({ email: '', password: '' }); setModal('auth'); }} onSwitchAccount={() => setModal('switch-account-confirm')} notificationPreferences={notificationPreferences} onNotificationPreferencesChange={saveNotificationPreferences} onPushChange={configureBrowserPush} /> : view === 'notifications' ? <NotificationsPage notifications={notifications} unreadCount={unreadNotificationCount} onMarkAllRead={markAllNotificationsRead} onOpen={openNotification} loading={loading} hasMore={notificationHasMore} loadingMore={loadingMoreNotifications} onLoadMore={loadMoreNotifications} onRetry={() => refreshNotifications().catch((err) => notify(userFacingFeedback(err.message), 'error'))} /> : view !== 'calendar' ? <>
         <div className="toolbar"><h2>{listTitle}</h2><div className="toolbar-actions"><TextInput className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by title" aria-label="Search tasks by title" /><AppButton className="filter-toggle" aria-expanded={mobileFiltersOpen} aria-controls="task-filters" onClick={() => setMobileFiltersOpen((open) => !open)}>Filter</AppButton></div></div>
         <div className={`filters ${mobileFiltersOpen ? 'filters-open' : ''}`} id="task-filters"><label className="sort-control">Sort<select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort tasks"><option value="manual">Manual order</option><option value="due">Due date</option><option value="priority">Priority</option><option value="created">Creation date</option><option value="alpha">Alphabetical</option></select></label><AppButton className="create-tag-btn" onClick={openTagForm}>＋ Create tag</AppButton><select aria-label="Filter status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="">Any status</option>{['To Do', 'Pending', 'Acknowledged', 'In Progress', 'Completed'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter priority" value={filters.priority} onChange={(event) => setFilters({ ...filters, priority: event.target.value })}><option value="">Any priority</option>{['High', 'Medium', 'Low'].map((value) => <option key={value}>{value}</option>)}</select><select aria-label="Filter tag" value={filters.tag} onChange={(event) => setFilters({ ...filters, tag: event.target.value })}><option value="">Any tag</option>{tags.map((tag) => <option key={tag}>{tag}</option>)}</select><select aria-label="Filter folder" value={filters.folder} onChange={(event) => setFilters({ ...filters, folder: event.target.value })}><option value="">Any folder</option>{folders.map((folder) => <option key={folder}>{folder}</option>)}</select><select aria-label="Filter date" value={filters.date} onChange={(event) => setFilters({ ...filters, date: event.target.value })}><option value="">Any date</option><option value="overdue">Overdue</option><option value="today">Due today</option><option value="week">Next 7 days</option><option value="none">No due date</option></select></div>
         {view === 'all' && <section className="weekly-review" aria-label="Weekly summaries"><div className="weekly-review-heading"><div><h2>Weekly task view</h2><p>Showing this week’s tasks · {fmtDate(`${currentWeek.start}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${currentWeek.end}T12:00:00`, { month: 'short', day: 'numeric' })}</p></div><strong>{completedThisWeek} completed this week</strong></div>{authUser && <div className="task-scope-tabs" role="tablist" aria-label="Choose task list">{[['mine','My tasks'],['shared','Shared with me'],['all','All tasks']].map(([key,label]) => <AppButton key={key} role="tab" aria-selected={taskScope === key} className={taskScope === key ? 'active' : ''} onClick={() => setTaskScope(key)}>{label}{key === 'shared' && sharedTasks.length > 0 ? ` (${sharedTasks.length})` : ''}</AppButton>)}</div>}<div className="weekly-review-list"><h3>Past weekly summaries</h3>{weeklySummaries.some((summary) => summary.tasks?.length > 0) ? weeklySummaries.filter((summary) => summary.tasks?.length > 0).map((summary) => <article className="weekly-summary-row" key={summary.id}><div className="weekly-summary-label"><strong>{fmtDate(`${summary.weekStart}T12:00:00`, { month: 'short', day: 'numeric' })}–{fmtDate(`${summary.weekEnd}T12:00:00`, { month: 'short', day: 'numeric', year: 'numeric' })}</strong><span>{summary.tasks.length} task{summary.tasks.length === 1 ? '' : 's'} completed</span></div><div className="weekly-summary-actions"><AppButton className="text-link" onClick={() => openWeeklySummary(summary)}>View summary</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'word')}>Word document</AppButton><AppButton className="secondary-button" onClick={() => exportWeeklySummary(summary, username, 'excel')}>Excel workbook</AppButton></div></article>) : <p className="weekly-summary-empty">Your first weekly report will appear here after this week ends.</p>}</div></section>}
-        <section className="task-list" aria-label="Tasks">{loading ? <div className="empty">Loading your tasks…</div> : error ? <div className="empty"><strong>Could not load Spectre</strong><span>{error}</span><AppButton className="save-task" onClick={reload}>Retry</AppButton></div> : visibleTasks.length ? visibleTasks.map((task) => <TaskCard key={`${task.shared ? 'shared-' : ''}${task.id}`} task={task} onToggle={!task.shared || task.sharedPermission === 'editor' ? toggleTask : undefined} onEdit={!task.shared || task.sharedPermission === 'editor' ? () => editTask(task) : undefined} onOpen={() => setSelectedTask(task)} onDrop={task.shared ? undefined : moveTask} />) : <div className="empty"><strong>{search ? 'No matching tasks' : view === 'folder' ? 'This folder is empty' : view === 'tag' ? 'No tasks use this tag yet' : view === 'completed' ? 'No completed tasks yet' : view === 'all' && taskScope === 'shared' ? 'No one has shared a task with you yet' : view === 'all' ? 'No tasks planned for this week' : 'No tasks to show'}</strong><span>{view === 'folder' ? 'Create a task in this folder to get started.' : view === 'tag' ? 'Create a task with this tag to get started.' : search ? 'Clear your search or add a new task.' : view === 'all' && taskScope === 'shared' ? 'When someone shares a task with your email, it will appear here.' : view === 'all' ? 'Add this week’s tasks here. Later tasks remain in Upcoming.' : 'Add a task whenever you’re ready.'}</span>{!(view === 'all' && taskScope === 'shared') && <div className="empty-actions"><AppButton className="save-task" onClick={() => startCreateTask({ folder: view === 'folder' ? selectedFolder : '', tag: view === 'tag' ? selectedTag : '' })}>Create task</AppButton></div>}</div>}</section>
+        <section className="task-list" aria-label="Tasks" aria-busy={loading}>{loading ? <TaskListSkeleton /> : error ? <div className="empty" role="alert"><strong>{sessionExpired ? 'Your session has ended' : 'We couldn’t load your tasks'}</strong><span>{sessionExpired ? 'Sign in again to continue. Your saved tasks are still safe.' : userFacingFeedback(error)}</span>{sessionExpired && <AppButton className="save-task" onClick={() => { setAuthMode('login'); setAuthDraft({ email: '', password: '' }); setModal('auth'); }}>Sign in</AppButton>}<AppButton className="secondary-button" onClick={reload}>Try again</AppButton></div> : visibleTasks.length ? visibleTasks.map((task) => <TaskCard key={`${task.shared ? 'shared-' : ''}${task.id}`} task={task} onToggle={!task.shared || task.sharedPermission === 'editor' ? toggleTask : undefined} onEdit={!task.shared || task.sharedPermission === 'editor' ? () => editTask(task) : undefined} onOpen={() => setSelectedTask(task)} onDrop={task.shared ? undefined : moveTask} />) : <div className="empty"><strong>{search ? 'No matching tasks' : view === 'folder' ? 'This folder is empty' : view === 'tag' ? 'No tasks use this tag yet' : view === 'completed' ? 'No completed tasks yet' : view === 'all' && taskScope === 'shared' ? 'No one has shared a task with you yet' : view === 'all' ? 'No tasks planned for this week' : 'No tasks to show'}</strong><span>{view === 'folder' ? 'Create a task in this folder to get started.' : view === 'tag' ? 'Create a task with this tag to get started.' : search ? 'Clear your search or add a new task.' : view === 'all' && taskScope === 'shared' ? 'When someone shares a task with your email, it will appear here.' : view === 'all' ? 'Add this week’s tasks here. Later tasks remain in Upcoming.' : 'Add a task whenever you’re ready.'}</span>{!(view === 'all' && taskScope === 'shared') && <div className="empty-actions"><AppButton className="save-task" onClick={() => startCreateTask({ folder: view === 'folder' ? selectedFolder : '', tag: view === 'tag' ? selectedTag : '' })}>Create task</AppButton></div>}</div>}</section>
       </> : <CalendarView tasks={tasks} googleEvents={googleCalendarEvents} month={month} setMonth={setMonth} selectedDay={selectedDay} setSelectedDay={setSelectedDay} onDrop={moveTask} onCreate={(day = selectedDay) => { setSelectedDay(day); setMonth(new Date(`${day}T12:00:00`)); startCreateTask({ start: day, due: `${day}T09:00` }); }} onOpen={setSelectedTask} onToggle={toggleTask} onEdit={editTask} />}
     </main>
 
@@ -1025,14 +1099,13 @@ function App() {
     {modal === 'signout-confirm' && <Modal title="Sign out?" onClose={() => setModal(null)}><p className="auth-copy">You can continue using Spectre as a guest on this device.</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => setModal(null)}>Cancel</AppButton><AppButton className="save-task" loading={busyAction === 'sign-out'} onClick={signOut}>{busyAction === 'sign-out' ? 'Signing out…' : 'Sign out'}</AppButton></div></Modal>}
     {modal === 'switch-account-confirm' && <Modal title="Switch account?" onClose={() => setModal(null)}><p className="auth-copy">You’ll sign out of this account and return to the login screen. Your account data stays saved, and this device’s guest tasks remain available.</p><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => setModal(null)}>Cancel</AppButton><AppButton className="save-task" loading={busyAction === 'sign-out'} onClick={() => signOut(true)}>{busyAction === 'sign-out' ? 'Switching…' : 'Continue'}</AppButton></div></Modal>}
     {modal === 'feedback' && <Modal title={feedback.title} onClose={() => setModal(null)}><p className={`feedback-copy ${feedback.kind}`}>{feedback.message}</p><div className="modal-actions auth-actions"><AppButton className="save-task" onClick={() => setModal(null)}>Done</AppButton></div></Modal>}
-    {dueAlert && <Modal title="Task due now" onClose={() => setDueAlert(null)}><div className="due-alert"><strong>{dueAlert.title}</strong>{dueAlert.description && <p>{dueAlert.description}</p>}<span>Due {fmtDate(dueAlert.due, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span></div><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => setDueAlert(null)}>Dismiss</AppButton><AppButton className="save-task" onClick={() => { setSelectedTask(dueAlert); setDueAlert(null); }}>View task</AppButton></div></Modal>}
     {modal === 'folder' && <Modal title="Create folder" onClose={() => setModal(null)}><form onSubmit={createFolder}><label className="field">Folder name<TextInput required autoFocus value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} placeholder="e.g. Home" /></label><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'create-folder'}>{busyAction === 'create-folder' ? 'Creating…' : 'Create folder'}</AppButton></div></form></Modal>}
     {modal === 'tag' && <Modal title="Create tag" onClose={() => setModal(null)}><form onSubmit={createTag}><label className="field">Tag name<TextInput required autoFocus value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} placeholder="e.g. Focus" /></label><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'create-tag'}>{busyAction === 'create-tag' ? 'Creating…' : 'Create tag'}</AppButton></div></form></Modal>}
     {modal === 'username' && <Modal title="Your username" onClose={() => setModal(null)}><form onSubmit={changeUsername}><label className="field">Username<TextInput required maxLength="80" autoFocus value={usernameDraft} onChange={(event) => setUsernameDraft(event.target.value)} /></label><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'username'}>{busyAction === 'username' ? 'Saving…' : 'Update'}</AppButton></div></form></Modal>}
     {modal === 'note' && <Modal title={noteEditId ? 'Edit note' : 'New note'} onClose={() => { setModal(null); setNoteEditId(null); }}><form onSubmit={addNote}><label className="field">Title (optional)<TextInput value={noteDraft.title} onChange={(event) => setNoteDraft({ ...noteDraft, title: event.target.value })} placeholder="e.g. Biology lecture — cell structure" /></label><div className="note-dictation-heading"><label className="field">Arrange as<select value={noteFormat} onChange={(event) => { const format = event.target.value; setNoteFormat(format); if (noteDraft.text.trim()) void rearrangeNote(format, 'format'); }} aria-label="Dictation format"><option value="bullets">Bullet points</option><option value="paragraphs">Paragraphs</option></select></label><span>Keep speaking through pauses. Spectre won’t interrupt or ask questions.</span></div><VoiceTextArea dictationRef={noteDictationRef} required rows="10" value={noteDraft.text} format={noteFormat} onChange={(text) => setNoteDraft({ ...noteDraft, text })} /><div className="note-editor-actions"><AppButton type="button" className="secondary-button" loading={busyAction === 'note-rewrite'} disabled={!noteDraft.text.trim()} onClick={() => rearrangeNote(noteFormat, 'polish')}>✦ Rearrange with AI</AppButton><AppButton className="save-task" loading={busyAction === 'save-note'}>{busyAction === 'save-note' ? 'Saving…' : noteEditId ? 'Save changes' : 'Save note'}</AppButton></div></form></Modal>}
     {selectedTask && <TaskDetail task={selectedTask} authUser={authUser} onInvite={openTaskInvite} onUpdated={() => { reload(); refreshNotifications().catch(() => {}); }} deleting={busyAction === `delete-${selectedTask.id}`} toggling={busyAction === `toggle-${selectedTask.id}`} savingSubtask={() => busyAction === `subtask-${selectedTask.id}`} onClose={() => setSelectedTask(null)} onEdit={() => editTask(selectedTask)} onToggle={() => toggleTask(selectedTask)} onSubtask={(index) => toggleSubtask(selectedTask, index)} onDelete={() => deleteTask(selectedTask)} />}
     {!assistantOpen && <AppButton className="assistant-fab" aria-label="Open Spectre Assistant" title="Open Spectre Assistant" onClick={() => setAssistantOpen(true)}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.64 5.64l1.42 1.42m9.88 9.88 1.42 1.42m0-12.72-1.42 1.42m-9.88 9.88-1.42 1.42" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" stroke="currentColor" strokeWidth="1.7"/></svg><span className="assistant-fab-label">Ask Spectre</span></AppButton>}
-    {toast && <div className="toast">{toast}</div>}
+    {toast && <div className={`toast toast-${toast.kind}`} role={toast.kind === 'error' ? 'alert' : 'status'} aria-live={toast.kind === 'error' ? 'assertive' : 'polite'}><span>{toast.message}</span>{toast.action?.label && <AppButton className="toast-action" onClick={toast.action.onClick}>{toast.action.label}</AppButton>}<AppButton className="toast-dismiss" aria-label="Dismiss notification" onClick={() => setToast(null)}>×</AppButton></div>}
   </div>;
 }
 
@@ -1383,7 +1456,29 @@ function profilePhotoSource(source) {
   } catch { return source; }
 }
 
-function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpdate, onPasswordUpdate, onAvatarChange, busyAction, googleCalendarStatus, onConnectCalendar, onDisconnectCalendar, onSignIn, onSwitchAccount }) {
+function TaskListSkeleton() {
+  return <div className="task-skeleton-list" aria-label="Loading tasks" role="status"><span className="sr-only">Loading your tasks</span>{[0, 1, 2].map((row) => <div className="task-skeleton" key={row}><span /><div><i /><i /><i /></div></div>)}</div>;
+}
+
+function NotificationsPage({ notifications, unreadCount, onMarkAllRead, onOpen, loading, hasMore, loadingMore, onLoadMore, onRetry }) {
+  const sections = useMemo(() => {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1);
+    const groups = new Map([['Today', []], ['Yesterday', []], ['Earlier', []]]);
+    for (const item of notifications) {
+      const date = new Date(item.createdAt); date.setHours(0, 0, 0, 0);
+      const label = date.getTime() === today.getTime() ? 'Today' : date.getTime() === yesterday.getTime() ? 'Yesterday' : 'Earlier';
+      groups.get(label).push(item);
+    }
+    return [...groups.entries()].filter(([, rows]) => rows.length);
+  }, [notifications]);
+  return <section className="notifications-page" aria-label="Notification inbox">
+    <header className="notifications-heading"><div><h2>Notifications</h2><p>Task reminders and account updates, all in one place.</p></div>{unreadCount > 0 && <AppButton className="secondary-button" onClick={onMarkAllRead}>Mark all as read</AppButton>}</header>
+    {loading ? <div className="notification-skeleton" role="status">Loading your notifications…</div> : sections.length ? <>{sections.map(([label, items]) => <section className="notification-group" key={label}><h3>{label}</h3>{items.map((item) => <AppButton key={item.id} className={`notification-card ${item.readAt ? '' : 'unread'}`} onClick={() => onOpen(item)}><span className="notification-indicator" aria-hidden="true" /><span className="notification-card-copy"><strong>{item.title}</strong><span>{item.message}</span><small>{fmtDate(item.createdAt, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></span><span className="notification-open-hint">{item.relatedTaskId ? 'View task' : 'Open'}</span></AppButton>)}</section>)}{hasMore && <AppButton className="secondary-button notification-load-more" loading={loadingMore} onClick={onLoadMore}>{loadingMore ? 'Loading…' : 'Load older notifications'}</AppButton>}</> : <div className="empty notification-page-empty"><strong>You’re all caught up</strong><span>Reminders and updates will appear here when there’s something new.</span><AppButton className="secondary-button" onClick={onRetry}>Refresh notifications</AppButton></div>}
+  </section>;
+}
+
+function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpdate, onPasswordUpdate, onAvatarChange, busyAction, googleCalendarStatus, onConnectCalendar, onDisconnectCalendar, onSignIn, onSwitchAccount, notificationPreferences, onNotificationPreferencesChange, onPushChange }) {
   const [photoError, setPhotoError] = useState('');
   const [photoSuccess, setPhotoSuccess] = useState('');
   const [photoModal, setPhotoModal] = useState(false);
@@ -1415,11 +1510,27 @@ function ProfilePage({ username, authUser, profileDraft, setProfileDraft, onUpda
     <input ref={photoInput} className="profile-photo-input" type="file" accept="image/jpeg,image/png,image/webp" onChange={selectPhoto} aria-label="Choose profile image" />
     <div className="profile-card profile-overview"><div className="profile-avatar-edit"><AppButton type="button" className="profile-avatar-open" title="View profile photo" aria-label="View profile photo" onClick={() => setViewPhoto(true)}><span className="profile-avatar">{avatar ? <img src={avatar} alt={`${username}'s profile`} onError={(event) => { event.currentTarget.hidden = true; }} /> : (username || 'U').slice(0, 1).toUpperCase()}</span></AppButton><AppButton type="button" className="profile-avatar-edit-icon" title={authUser ? 'Change profile photo' : 'Sign in to add a photo'} aria-label={authUser ? 'Change profile photo' : 'Sign in to add a photo'} onClick={choosePhoto}>✎</AppButton></div><div><span className="profile-eyebrow">{authUser ? 'Account profile' : 'Guest profile'}</span><h2>{username}</h2><p>{authUser ? 'Manage your details and account security.' : 'Your tasks stay on this device until you sign in.'}</p>{photoError && <small className="profile-photo-error" role="alert">{photoError}</small>}{photoSuccess && <small className="profile-photo-success" role="status">{photoSuccess}</small>}{busyAction === 'profile-image' && <small>Uploading photo…</small>}{authUser && <AppButton type="button" className="text-link profile-switch-account" onClick={onSwitchAccount}>Switch account</AppButton>}</div></div>
     <form className="profile-card profile-form" onSubmit={onUpdate}><h2>Personal details</h2><div className="form-grid"><label className="field">Username<TextInput required maxLength="80" value={profileDraft.username} onChange={(event) => setProfileDraft({ ...profileDraft, username: event.target.value })} /></label><label className="field">Phone number<TextInput type="tel" maxLength="40" value={profileDraft.phone} onChange={(event) => setProfileDraft({ ...profileDraft, phone: event.target.value })} placeholder="Add a phone number" /></label><label className="field full">Email<TextInput type="email" value={authUser?.email || 'Guest account — no email'} readOnly /></label></div><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'profile'}>{busyAction === 'profile' ? 'Updating…' : 'Update'}</AppButton></div></form>
-    <section className="profile-card google-calendar-card"><div><h2>Google Calendar</h2><p>View your Google Calendar events in Spectre and check for time conflicts when creating tasks.</p>{googleCalendarStatus?.connected && <small>Connected{googleCalendarStatus.email ? ` to ${googleCalendarStatus.email}` : ''}.</small>}</div>{authUser ? googleCalendarStatus?.connected ? <AppButton className="secondary-button" loading={busyAction === 'google-calendar-disconnect'} onClick={onDisconnectCalendar}>Disconnect</AppButton> : <AppButton className="save-task" loading={busyAction === 'google-calendar'} onClick={onConnectCalendar}><GoogleMark />{busyAction === 'google-calendar' ? 'Connecting…' : 'Connect Google Calendar'}</AppButton> : <AppButton className="secondary-button" onClick={onSignIn}>Sign in to connect</AppButton>}</section>{authUser ? <details className="profile-card password-collapse"><summary><h2>Change password</h2><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m6 9 6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg></summary><form className="profile-form" onSubmit={onPasswordUpdate}><p className="auth-copy">Confirm your current password before choosing a new one.</p><div className="form-grid"><PasswordField name="currentPassword" label="Current password" required autoComplete="current-password" /><PasswordField name="newPassword" label="New password" required minLength="8" autoComplete="new-password" /><PasswordField name="confirmPassword" label="Confirm new password" required minLength="8" autoComplete="new-password" /></div><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'profile-password'}>{busyAction === 'profile-password' ? 'Updating…' : 'Update password'}</AppButton></div></form></details> : <div className="profile-card profile-signin"><h2>Want to access scheduled actions?</h2><p>Create an account or sign in to use reminders and sync your profile.</p><AppButton className="save-task" onClick={onSignIn}>Sign in or create account</AppButton></div>}
+    <section className="profile-card notification-preferences"><h2>Notification preferences</h2><p>Choose which updates Spectre should keep in your inbox.</p><label><span><strong>In-app notifications</strong><small>Show reminders and updates in Spectre.</small></span><input type="checkbox" checked={notificationPreferences.inApp} onChange={(event) => onNotificationPreferencesChange({ inApp: event.target.checked })} /></label><label><span><strong>Task due reminders</strong><small>Let me know when a task reminder is due.</small></span><input type="checkbox" checked={notificationPreferences.taskReminders} disabled={!notificationPreferences.inApp && !notificationPreferences.browserPush} onChange={(event) => onNotificationPreferencesChange({ taskReminders: event.target.checked })} /></label><label><span><strong>Collaboration updates</strong><small>Tell me when shared tasks change.</small></span><input type="checkbox" checked={notificationPreferences.collaborationUpdates} onChange={(event) => onNotificationPreferencesChange({ collaborationUpdates: event.target.checked })} /></label><div className="push-preference-note"><span><strong>Browser notifications</strong><small>{notificationPreferences.browserPushAvailable ? 'Get an alert even when Spectre is closed (supported browsers only).' : 'Browser alerts need a small one-time setup on the backend. Your Spectre inbox works without it.'}</small></span><AppButton className={notificationPreferences.browserPush ? 'secondary-button' : 'save-task'} disabled={busyAction === 'push-subscription' || (!notificationPreferences.browserPushAvailable && !notificationPreferences.browserPush)} loading={busyAction === 'push-subscription'} onClick={() => onPushChange(!notificationPreferences.browserPush)}>{notificationPreferences.browserPush ? 'Turn off' : 'Enable'}</AppButton></div></section>
+    <section className="profile-card google-calendar-card"><div><h2>Google Calendar</h2><p>View your Google Calendar events in Spectre and check for time conflicts when creating tasks.</p>{googleCalendarStatus?.connected && <small>Connected{googleCalendarStatus.email ? ` to ${googleCalendarStatus.email}` : ''}.</small>}</div>{authUser ? googleCalendarStatus?.connected ? <AppButton className="secondary-button" loading={busyAction === 'google-calendar-disconnect'} onClick={onDisconnectCalendar}>Disconnect</AppButton> : <AppButton className="save-task" loading={busyAction === 'google-calendar'} onClick={onConnectCalendar}><GoogleMark />{busyAction === 'google-calendar' ? 'Connecting…' : 'Connect Google Calendar'}</AppButton> : <AppButton className="secondary-button" onClick={onSignIn}>Sign in to connect</AppButton>}</section>{authUser ? <details className="profile-card password-collapse"><summary><h2>Change password</h2><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="m6 9 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg></summary><form className="profile-form" onSubmit={onPasswordUpdate}><p className="auth-copy">Confirm your current password before choosing a new one.</p><div className="form-grid"><PasswordField name="currentPassword" label="Current password" required autoComplete="current-password" /><PasswordField name="newPassword" label="New password" required minLength="8" autoComplete="new-password" /><PasswordField name="confirmPassword" label="Confirm new password" required minLength="8" autoComplete="new-password" /></div><div className="modal-actions"><AppButton className="save-task" loading={busyAction === 'profile-password'}>{busyAction === 'profile-password' ? 'Updating…' : 'Update password'}</AppButton></div></form></details> : <div className="profile-card profile-signin"><h2>Want to access scheduled actions?</h2><p>Create an account or sign in to use reminders and sync your profile.</p><AppButton className="save-task" onClick={onSignIn}>Sign in or create account</AppButton></div>}
     {viewPhoto && <Modal title={`${username}'s profile photo`} onClose={() => setViewPhoto(false)} className="profile-photo-modal"><div className="profile-photo-large">{avatar ? <img src={avatar} alt={`${username}'s profile`} /> : (username || 'U').slice(0, 1).toUpperCase()}</div><div className="modal-actions auth-actions"><AppButton className="secondary-button" onClick={() => setViewPhoto(false)}>Close</AppButton><AppButton className="save-task" onClick={choosePhoto}>{authUser ? 'Change photo' : 'Sign in to add a photo'}</AppButton></div></Modal>}
     {photoModal && <Modal title="Preview profile photo" onClose={() => { if (busyAction !== 'profile-image') { setPhotoModal(false); setSelectedPhoto(null); } }} className="profile-photo-modal"><p className="auth-copy">Check how your photo looks before saving. It will appear cropped to a circle.</p><div className="profile-photo-large">{previewUrl && <img src={previewUrl} alt="Preview of the selected profile photo" />}</div>{photoError && <p className="profile-photo-error" role="alert">{photoError}</p>}<div className="modal-actions auth-actions"><AppButton className="secondary-button" disabled={busyAction === 'profile-image'} onClick={() => { setPhotoModal(false); setSelectedPhoto(null); }}>Cancel</AppButton><AppButton className="save-task" loading={busyAction === 'profile-image'} onClick={confirmPhoto}>{busyAction === 'profile-image' ? 'Uploading…' : 'Use this photo'}</AppButton></div></Modal>}
   </section>;
 }
 
 const guestReminderToken = getGuestReminderToken();
-createRoot(document.getElementById('root')).render(<React.StrictMode>{guestReminderToken ? <GuestReminderPage token={guestReminderToken} /> : <App />}</React.StrictMode>);
+function NotFoundPage() {
+  return <main className="guest-reminder-page"><section className="guest-reminder-card"><div className="brand"><span className="brand-icon">✓</span>Spectre</div><h1>We couldn’t find that page.</h1><p className="guest-reminder-copy">The link may be outdated, or the page may have moved.</p><a className="app-button save-task guest-cta" href="/">Back to your tasks</a></section></main>;
+}
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { failed: false }; }
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(error) { console.error('[Spectre] A screen failed to render.', error?.name || 'Unknown error'); }
+  render() {
+    if (this.state.failed) return <main className="guest-reminder-page"><section className="guest-reminder-card" role="alert"><h1>We hit a problem.</h1><p className="guest-reminder-copy">Your data is safe. Reload Spectre to try again.</p><AppButton className="save-task guest-cta" onClick={() => window.location.reload()}>Reload Spectre</AppButton><a className="guest-app-link" href="/">Go to your tasks</a></section></main>;
+    return this.props.children;
+  }
+}
+
+const validAppPath = ['/', '/index.html'].includes(window.location.pathname);
+createRoot(document.getElementById('root')).render(<React.StrictMode><AppErrorBoundary>{guestReminderToken ? <GuestReminderPage token={guestReminderToken} /> : validAppPath ? <App /> : <NotFoundPage />}</AppErrorBoundary></React.StrictMode>);

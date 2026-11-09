@@ -76,9 +76,34 @@ export class AppController {
   @Post('scheduled-actions/:id/revoke-link') revokeScheduledActionLink(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.revokeGuestReminderAccess(this.requireUser(request), id); }
   @Post('guest/reminders/view') guestReminder(@Body('token') token: string, @Req() request: IdentityRequest) { return this.auth.getGuestReminder(token, request.ip || 'unknown'); }
   @Post('guest/reminders/acknowledge') acknowledgeGuestReminder(@Body('token') token: string, @Req() request: IdentityRequest) { return this.auth.acknowledgeGuestReminder(token, request.ip || 'unknown'); }
-  @Get('notifications') notifications(@Req() request: IdentityRequest) { return this.auth.listNotifications(this.requireUser(request)); }
-  @Patch('notifications/:id/read') markNotificationRead(@Req() request: IdentityRequest, @Param('id') id: string) { return this.auth.markNotificationRead(this.requireUser(request), id); }
-  @Post('notifications/read-all') markAllNotificationsRead(@Req() request: IdentityRequest) { return this.auth.markAllNotificationsRead(this.requireUser(request)); }
+  @Get('notifications') notifications(@Req() request: IdentityRequest, @Query('offset') offsetValue?: string) {
+    const identity = request.identity;
+    if (!identity) throw new UnauthorizedException('Refresh Spectre to load your notifications.');
+    const offset = Math.min(5000, Math.max(0, Number.parseInt(offsetValue || '0', 10) || 0));
+    return identity.type === 'user' ? this.auth.listNotifications(identity.id, offset) : this.auth.listGuestNotifications(`guest:${identity.deviceId}`, offset);
+  }
+  @Patch('notifications/:id/read') markNotificationRead(@Req() request: IdentityRequest, @Param('id') id: string) {
+    const identity = request.identity;
+    if (!identity) throw new UnauthorizedException('Refresh Spectre to update your notifications.');
+    return identity.type === 'user' ? this.auth.markNotificationRead(identity.id, id) : this.auth.markGuestNotificationRead(`guest:${identity.deviceId}`, id);
+  }
+  @Post('notifications/read-all') markAllNotificationsRead(@Req() request: IdentityRequest) {
+    const identity = request.identity;
+    if (!identity) throw new UnauthorizedException('Refresh Spectre to update your notifications.');
+    return identity.type === 'user' ? this.auth.markAllNotificationsRead(identity.id) : this.auth.markGuestNotificationsRead(`guest:${identity.deviceId}`);
+  }
+  @Get('notification-preferences') notificationPreferences(@Req() request: IdentityRequest) {
+    return this.auth.getNotificationPreferences(this.notificationOwnerScope(request));
+  }
+  @Put('notification-preferences') updateNotificationPreferences(@Req() request: IdentityRequest, @Body() body: Record<string, unknown>) {
+    return this.auth.updateNotificationPreferences(this.notificationOwnerScope(request), body);
+  }
+  @Post('notifications/push-subscription') savePushSubscription(@Req() request: IdentityRequest, @Body() body: Record<string, any>) {
+    return this.auth.savePushSubscription(this.notificationOwnerScope(request), body);
+  }
+  @Delete('notifications/push-subscription') removePushSubscription(@Req() request: IdentityRequest, @Body('endpoint') endpoint?: string) {
+    return this.auth.removePushSubscription(this.notificationOwnerScope(request), endpoint);
+  }
 
   @Get('tasks') tasks(@Query() query: Record<string, string>) { return this.service.listTasks(query); }
   @Get('weekly-summaries') weeklySummaries(@Query('timezone') timezone?: string) { return this.service.listWeeklySummaries(timezone); }
@@ -212,6 +237,11 @@ export class AppController {
   @Delete('google-calendar/connect') disconnectGoogleCalendar(@Req() request: IdentityRequest) { return this.googleCalendar.disconnect(this.requireUser(request)); }
 
   private requireUser(request: IdentityRequest) { if (request.identity?.type !== 'user') throw new UnauthorizedException('Sign in to use scheduled actions.'); return request.identity.id; }
+  private notificationOwnerScope(request: IdentityRequest) {
+    const identity = request.identity;
+    if (!identity) throw new UnauthorizedException('Refresh Spectre to manage notification settings.');
+    return identity.type === 'user' ? `user:${identity.id}` : `guest:${identity.deviceId}`;
+  }
   private readCookie(header: string | undefined, name: string) { const prefix = `${name}=`; return header?.split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length) || ''; }
   private oauthErrorReason(error: unknown) {
     const message = error instanceof Error ? error.message : '';
