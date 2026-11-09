@@ -30,7 +30,7 @@ describe('AuthService (Supabase integration boundary)', () => {
       newClient: jest.fn(() => ({ auth: { signInWithPassword: jest.fn(async ({ email }: { email: string }) => ({ data: { user: { id: 'user-1', email }, session: { access_token: 'valid-access', refresh_token: 'refresh-1' } }, error: null })) } })),
       db: {},
     };
-    auth = new AuthService(supabase, store);
+    auth = new AuthService(supabase, store, { available: false, publicKey: '', send: jest.fn() } as any);
   });
 
   it('creates Supabase Auth accounts and returns a non-sensitive user and session cookie value', async () => {
@@ -86,6 +86,7 @@ describe('AuthService (Supabase integration boundary)', () => {
   it('claims and completes scheduled email reminders through the atomic database RPC', async () => {
     const sent: string[] = [];
     const workerAuth = {
+      processDueTaskNotifications: jest.fn().mockResolvedValue(undefined),
       claimDueActions: jest.fn().mockResolvedValue([{ id: 'action-1', recipientName: 'Jamie', recipientEmail: 'jamie@example.com', subject: 'Reminder', message: 'Finish it', scheduledAt: Date.now() }]),
       createGuestReminderLink: jest.fn(async () => 'https://spectre.example/#reminder=token'),
       sendEmail: jest.fn(async (to: string) => { sent.push(to); }),
@@ -122,6 +123,7 @@ describe('AuthService (Supabase integration boundary)', () => {
 
   it('records a failed delivery for database-managed retry instead of reporting success', async () => {
     const workerAuth = {
+      processDueTaskNotifications: jest.fn().mockResolvedValue(undefined),
       claimDueActions: jest.fn().mockResolvedValue([{ id: 'action-2', recipientName: 'Jamie', recipientEmail: 'jamie@example.com', subject: 'Reminder', message: 'Finish it', scheduledAt: Date.now() }]),
       createGuestReminderLink: jest.fn(async () => 'https://spectre.example/#reminder=token'),
       sendEmail: jest.fn(async () => { throw new Error('provider unavailable'); }),

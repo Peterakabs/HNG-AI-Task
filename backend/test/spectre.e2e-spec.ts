@@ -18,7 +18,10 @@ const runSupabaseE2E = process.env.SPECTRE_RUN_SUPABASE_E2E === 'true' && Boolea
     const key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY!;
     admin = createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = moduleRef.createNestApplication();
+    // The workspace may resolve the Nest interface through two equivalent
+    // package paths (pnpm virtual store and workspace link); the runtime app is
+    // the same, so bridge the duplicate declaration for this integration test.
+    app = moduleRef.createNestApplication() as unknown as INestApplication;
     await app.init();
   });
 

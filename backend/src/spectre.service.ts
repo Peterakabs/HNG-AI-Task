@@ -129,7 +129,7 @@ export class SpectreService {
     const task = {
       id: this.store.id(), title: input.title.trim(), description: input.description?.trim() || '',
       start: typeof input.start === 'string' && input.start ? input.start : input.due.slice(0, 10), due: input.due, status: input.status, priority: input.priority,
-      emailReminder: Boolean(input.emailReminder),
+      emailReminder: Boolean(input.emailReminder), reminderAt: input.reminderAt || null, reminderTimezone: input.reminderTimezone || null,
       folder: input.folder || '', tags: this.cleanTags(input.tags), subtasks: this.normalizeSubtasks(input.subtasks || [], [], undefined),
       attachments: input.attachments || [], notes: input.notes?.trim() || '',
       recurrence: input.recurrence || '', recurrenceId: input.recurrence ? this.store.id() : undefined, reminder: input.reminder || '', notified: false,
@@ -152,7 +152,7 @@ export class SpectreService {
     this.validateTask(merged, true);
     Object.assign(task, merged, {
       title: merged.title.trim(), description: merged.description?.trim() || '',
-      tags: this.cleanTags(merged.tags), notified: merged.due === task.due ? task.notified : false,
+      tags: this.cleanTags(merged.tags), notified: merged.due === task.due && merged.reminder === task.reminder ? task.notified : false,
     });
     if (input.status === 'Completed' && !wasCompleted) task.completedAt = new Date().toISOString();
     if (input.status && input.status !== 'Completed') delete task.completedAt;
@@ -176,8 +176,12 @@ export class SpectreService {
     const normalized = items.map((item, index) => {
       if (!item || typeof item !== 'object' || typeof item.text !== 'string' || !item.text.trim() || item.text.length > 500) throw new BadRequestException('Each checklist item needs text between 1 and 500 characters.');
       const old = (item.id && previous.find((entry) => entry.id === item.id)) || previous[index];
-      const isCompleted = Boolean(item.is_completed ?? item.done);
       const wasCompleted = Boolean(old?.is_completed ?? old?.done);
+      // Keep compatibility with both the newer is_completed field and the
+      // older done field. Prefer whichever field changed from the stored row.
+      const doneChanged = typeof item.done === 'boolean' && item.done !== Boolean(old?.done ?? old?.is_completed);
+      const completedChanged = typeof item.is_completed === 'boolean' && item.is_completed !== Boolean(old?.is_completed ?? old?.done);
+      const isCompleted = doneChanged ? item.done : completedChanged ? item.is_completed : Boolean(item.is_completed ?? item.done);
       const completedAt = isCompleted ? (!wasCompleted || !old?.completed_at ? new Date().toISOString() : old.completed_at) : null;
       const completedBy = isCompleted ? (!wasCompleted || !old?.completed_by ? (actorUserId || null) : old.completed_by) : null;
       return { ...item, text: item.text.trim(), id: typeof item.id === 'string' && item.id ? item.id : old?.id || randomUUID(), is_completed: isCompleted, done: isCompleted, completed_at: completedAt, completed_by: completedBy };
@@ -312,6 +316,7 @@ export class SpectreService {
     if (!priorities.includes(task.priority)) throw new BadRequestException('Priority must be High, Medium, or Low.');
     if (task.start !== undefined && task.start !== null && task.start !== '' && (typeof task.start !== 'string' || Number.isNaN(Date.parse(task.start)))) throw new BadRequestException('Start date must be valid when provided.');
     if (typeof task.due !== 'string' || !task.due || Number.isNaN(Date.parse(task.due))) throw new BadRequestException('A valid due date and time is required.');
+    if (task.reminderAt !== undefined && task.reminderAt !== null && task.reminderAt !== '' && (typeof task.reminderAt !== 'string' || Number.isNaN(Date.parse(task.reminderAt)))) throw new BadRequestException('Choose a valid reminder date and time.');
     if (!Array.isArray(task.subtasks || []) || !Array.isArray(task.attachments || []) || !Array.isArray(task.tags || [])) throw new BadRequestException('Tags, subtasks, and attachments must be arrays.');
   }
   private nextOccurrence(task: Record<string, any>, order: number) {
@@ -322,6 +327,22 @@ export class SpectreService {
     else return undefined;
     const pad = (n: number) => String(n).padStart(2, '0');
     const due = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-    return { ...task, id: this.store.id(), recurrenceId: task.recurrenceId || task.id, previousOccurrenceId: task.id, due, status: 'To Do', completedAt: undefined, createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false, is_completed: false, completed_at: null, completed_by: null })) };
+    const reminderAt = task.reminderAt ? this.localDateTimeToUtc(due, task.reminderTimezone || 'UTC') : null;
+    return { ...task, id: this.store.id(), recurrenceId: task.recurrenceId || task.id, previousOccurrenceId: task.id, due, reminderAt, status: 'To Do', completedAt: undefined, createdAt: Date.now(), notified: false, order, subtasks: task.subtasks.map((item: any) => ({ ...item, done: false, is_completed: false, completed_at: null, completed_by: null })) };
+  }
+
+  private localDateTimeToUtc(value: string, timeZone: string) {
+    const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+    if (!match) return null;
+    const [, year, month, day, hour, minute] = match.map(Number);
+    const target = Date.UTC(year, month - 1, day, hour, minute);
+    const formatter = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    let candidate = target;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const parts = Object.fromEntries(formatter.formatToParts(new Date(candidate)).map((part) => [part.type, part.value]));
+      const represented = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute));
+      candidate += target - represented;
+    }
+    return new Date(candidate).toISOString();
   }
 }
