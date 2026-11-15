@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { SupabaseService } from './supabase.service';
 
@@ -6,6 +6,7 @@ type GoogleEvent = { id: string; title: string; start: string; end: string; allD
 
 @Injectable()
 export class GoogleCalendarService {
+  private readonly logger = new Logger(GoogleCalendarService.name);
   constructor(private readonly supabase: SupabaseService) {}
 
   beginOAuth(userId: string) {
@@ -67,11 +68,14 @@ export class GoogleCalendarService {
     if (!connection) return { connected: false, email: null, events: [] as GoogleEvent[] };
     const accessToken = await this.googleAccessToken(this.decrypt(connection.encrypted_refresh_token));
     const query = new URLSearchParams({ timeMin: new Date(min).toISOString(), timeMax: new Date(max).toISOString(), singleEvents: 'true', orderBy: 'startTime', maxResults: '2500' });
-    const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${query}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+    const response = await this.googleRequest(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${query}`, { headers: { Authorization: `Bearer ${accessToken}` } });
     const payload = await response.json().catch(() => ({})) as any;
     if (!response.ok) {
       if (response.status === 401 || response.status === 403) throw new UnauthorizedException('Google Calendar access expired or was revoked. Reconnect Google Calendar from your profile.');
-      throw new ServiceUnavailableException(payload?.error?.message || 'Could not load Google Calendar events.');
+      const providerCode = typeof payload?.error?.status === 'string' ? payload.error.status : `HTTP_${response.status}`;
+      this.logger.warn(`Google Calendar events request failed (${providerCode}).`);
+      if (response.status === 429) throw new ServiceUnavailableException('Google Calendar is receiving too many requests. Wait a moment, then try again.');
+      throw new ServiceUnavailableException('Google Calendar could not load events right now. Please try again.');
     }
     const events: GoogleEvent[] = (payload.items || []).filter((item: any) => item.status !== 'cancelled').map((item: any) => ({
       id: String(item.id), title: String(item.summary || 'Untitled event'), start: String(item.start?.dateTime || item.start?.date || ''), end: String(item.end?.dateTime || item.end?.date || ''), allDay: !item.start?.dateTime, htmlLink: typeof item.htmlLink === 'string' ? item.htmlLink : undefined, description: typeof item.description === 'string' ? item.description.slice(0, 1000) : undefined,
@@ -137,10 +141,24 @@ export class GoogleCalendarService {
   private async googleAccessToken(refreshToken: string) {
     const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID?.trim(); const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET?.trim();
     if (!clientId || !clientSecret) throw new ServiceUnavailableException('Google Calendar is not configured on the backend. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET.');
-    const response = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' }) });
+    const response = await this.googleRequest('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' }) });
     const result = await response.json().catch(() => ({})) as any;
-    if (!response.ok || typeof result.access_token !== 'string') throw new UnauthorizedException('Could not refresh Google Calendar access. Reconnect Google Calendar from your profile.');
+    if (!response.ok || typeof result.access_token !== 'string') {
+      const providerCode = typeof result?.error === 'string' ? result.error : `HTTP_${response.status}`;
+      this.logger.warn(`Google Calendar token refresh failed (${providerCode}).`);
+      throw new UnauthorizedException('Could not refresh Google Calendar access. Reconnect Google Calendar from your profile.');
+    }
     return result.access_token as string;
+  }
+
+  private async googleRequest(url: string, init: RequestInit) {
+    try {
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
+    } catch (error) {
+      const category = error instanceof Error ? error.name : 'UnknownError';
+      this.logger.warn(`Google Calendar service request failed (${category}).`);
+      throw new ServiceUnavailableException('Google Calendar is temporarily unreachable. Check your connection and try again.');
+    }
   }
 
   private encryptionKey() {
